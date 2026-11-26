@@ -804,10 +804,14 @@ export class DriveSession {
     this.nextTrack = () => music.playNextInPool();
     this.unlockAudio = () => {
       if (disposed) return;
+      // Fast O(1) exit once both audio contexts are already unlocked and running (avoids work on every key press)
+      if (music.unlocked && audio?.isInitialized && audio.context?.state === "running") return;
       // The music unlocks on the same press, apart from the car audio (which a browser can refuse on its own)
       try {
-        music.unlock();
-        applyMusicSettings(settings);
+        if (!music.unlocked) {
+          music.unlock();
+          applyMusicSettings(settings);
+        }
       } catch (err) {
         console.warn("Music could not start", err);
       }
@@ -2014,6 +2018,36 @@ export class DriveSession {
     window.addEventListener("contextmenu", onFreeCamContextMenu);
 
     const onKeyDown = (e: KeyboardEvent) => {
+      // Fast path for OS key auto-repeat while actively driving (holding simultaneous keys like W+A+Space):
+      // avoids redundant audio unlocks, physicalKeys churn, slash-command checks, and DOM selector walks
+      // 30-50 times/sec while still allowing Alt seat-nudge, [ / ] FOV, and Free-cam key repeats.
+      if (
+        e.repeat &&
+        appPhaseNow === "driving" &&
+        !podium.playing &&
+        !this.snapshot.seatPanel &&
+        !this.snapshot.paused &&
+        !gpuLost &&
+        !e.altKey &&
+        !isFreeCamInteractive() &&
+        !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement)
+      ) {
+        const repeatCode = e.code;
+        if (repeatCode !== "BracketLeft" && repeatCode !== "BracketRight") {
+          const repeatAction = keyLookup.get(repeatCode);
+          if (repeatAction) {
+            if (
+              repeatAction === "freeCamera" ||
+              /^F\d+$/.test(repeatCode) ||
+              (!replay.active && !coolDown.active && (repeatCode === "Space" || repeatCode.startsWith("Arrow")))
+            ) {
+              e.preventDefault();
+            }
+            return;
+          }
+        }
+      }
+
       const isRangeInput = e.target instanceof HTMLInputElement && e.target.type === "range";
       if (
         (!isRangeInput && e.target instanceof HTMLInputElement) ||
@@ -2827,7 +2861,7 @@ export class DriveSession {
     };
     function compileForComposer(): Promise<THREE.Object3D> {
       const prevTarget = renderer.getRenderTarget();
-      renderer.setRenderTarget(postFx.composer.inputBuffer);
+      renderer.setRenderTarget(postFx.renderTarget());
       try {
         return renderer.compileAsync(scene, camera);
       } finally {
@@ -2907,7 +2941,7 @@ export class DriveSession {
             for (const o of hidden) o.visible = false;
             const prevTarget = renderer.getRenderTarget();
             try {
-              renderer.setRenderTarget(postFx.composer.inputBuffer);
+              renderer.setRenderTarget(postFx.renderTarget());
               renderer.render(scene, camera);
             } finally {
               renderer.setRenderTarget(prevTarget);
