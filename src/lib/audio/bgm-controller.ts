@@ -22,7 +22,7 @@
  *   filters, which stay in the chain.
  * Volume, mute and each pool's level come from the saved settings; a pool at zero plays nothing at all.
  */
-import { HOSTED_CONTENT } from "@/lib/hosted-content";
+import { HAS_LOCAL_MUSIC } from "@/lib/hosted-content";
 import { MUSIC_TRACKS, musicTrack, musicUrl, type MusicPool, type MusicTrack } from "./music-catalog";
 import { TrackBag, type MusicCue } from "./music-director";
 
@@ -463,7 +463,7 @@ export class AudioBGMController {
   }
 
   private playable(id: string): boolean {
-    return HOSTED_CONTENT && !this.disabled.has(id) && !this.unavailable.has(id);
+    return HAS_LOCAL_MUSIC && !this.disabled.has(id) && !this.unavailable.has(id);
   }
 
   /** Audible now: playing above silence (a fade-out under way still counts) */

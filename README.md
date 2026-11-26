@@ -127,7 +127,37 @@ librecorsa-offline --fullscreen
 librecorsa-offline --hub
 ```
 
-Optional Chromium/Electron flags can be placed one per line in `~/.config/librecorsa-offline-flags.conf`. If a GPU driver has issues with Chromium overrides, set `LIBRECORSA_NO_GPU_OVERRIDES=1`.
+Optional Chromium/Electron flags can be placed one per line in `~/.config/librecorsa-offline-flags.conf`. On Linux, Electron respects Chromium's native Mesa/Intel GPU defaults out of the box (opt into aggressive GPU flags with `LIBRECORSA_FORCE_GPU_OVERRIDES=1`, or force X11/Wayland with `LIBRECORSA_OZONE=x11` or `LIBRECORSA_OZONE=wayland` if holding keys stutters under Wayland).
+
+---
+
+## All Cars, Circuits & Soundtrack (Offline Content Packs)
+
+Upstream LibreCorsa only commits **RISE Motordrome** (Short & Grand Prix) and the **LC26 2026 Prototype** in Git. The other 12 cars (AMG GT3, BMW M4 GT3, MTR 496R, LC-LMDh, Suzuki Liana, Nissan R33 JGTC / R32 JTCC, BMW M1 Procar, VW Scirocco GTX, Chaparral 2D / '67, Porsche 934 RSR), all ~40 additional circuits (Monaco, Red Bull Ring, Watkins Glen, Le Mans '82, Istanbul Park, Okayama, VIR, etc.), shared tyre packs, and the 28-track classical soundtrack live on `https://librecorsa.org` (gitignored under `public/`).
+
+To download them once for **100% air-gapped offline play** (with zero runtime network requests):
+
+```bash
+# Inspect all cars & circuits and see what is installed locally
+npm run sync:content -- --list
+
+# Download EVERYTHING (all hosted cars, circuits, shared tyres, and soundtrack)
+npm run sync:content
+
+# Or download only what you want (resumable; skips files already on disk):
+npm run sync:content -- --cars
+npm run sync:content -- --tracks
+npm run sync:content -- --car=amg-gt3,bmw-m4-gt3,liana
+npm run sync:content -- --track=monaco,spielberg,watkins_glen
+npm run sync:content -- --no-skins --no-music   # Faster (default liveries, no soundtrack)
+```
+
+Then rebuild once — `npm run build` automatically detects every locally installed car, circuit, shared tyre pack, and music track under `public/`:
+
+```bash
+npm run build
+npm run desktop
+```
 
 ---
 

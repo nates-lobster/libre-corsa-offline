@@ -18,7 +18,7 @@
 import * as THREE from "three";
 import type { TireCompound } from "@/types/f1";
 import { withBasePath } from "@/lib/base-path";
-import { HOSTED_CONTENT } from "@/lib/hosted-content";
+import { HAS_SHARED_TYRES } from "@/lib/hosted-content";
 
 const TYRE_DIR = "/cars/shared/tyres/";
 type Rubber = "slick" | "intermediate";
@@ -210,7 +210,7 @@ export function createTyreWrap(
     uniforms.uTyreWrapCinturato.value = c === "intermediate" || c === "wet" ? 1 : 0;
     const rubber = rubberOf(c);
     // Once the textures could not be fetched the tyre has gone over to the sidewall for good: no fetch on every change
-    if (told || rubber === wanted || typeof window === "undefined" || !HOSTED_CONTENT) return;
+    if (told || rubber === wanted || typeof window === "undefined" || !HAS_SHARED_TYRES) return;
     wanted = rubber;
     // The tyre keeps the rubber it has until the new one is in
     void Promise.all([loadTexture(RUBBER_URL[rubber], THREE.SRGBColorSpace), loadTexture(ART_URL, THREE.NoColorSpace)]).then(

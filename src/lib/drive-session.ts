@@ -2043,6 +2043,9 @@ export class DriveSession {
             ) {
               e.preventDefault();
             }
+            if (isHeldKeyAction(repeatAction) && !replay.active) {
+              heldKeys[HELD_KEYS[repeatAction]] = true;
+            }
             return;
           }
         }
@@ -2861,7 +2864,7 @@ export class DriveSession {
     };
     function compileForComposer(): Promise<THREE.Object3D> {
       const prevTarget = renderer.getRenderTarget();
-      renderer.setRenderTarget(postFx.renderTarget());
+      renderer.setRenderTarget(postFx.composer.inputBuffer);
       try {
         return renderer.compileAsync(scene, camera);
       } finally {
@@ -2940,13 +2943,10 @@ export class DriveSession {
             const hidden = drawn.filter((o) => !part.has(o));
             for (const o of hidden) o.visible = false;
             const prevTarget = renderer.getRenderTarget();
-            const prevAutoClear = renderer.autoClear;
             try {
-              renderer.setRenderTarget(postFx.renderTarget());
-              renderer.autoClear = true;
+              renderer.setRenderTarget(postFx.composer.inputBuffer);
               renderer.render(scene, camera);
             } finally {
-              renderer.autoClear = prevAutoClear;
               renderer.setRenderTarget(prevTarget);
               for (const o of hidden) o.visible = true;
             }
