@@ -2940,10 +2940,13 @@ export class DriveSession {
             const hidden = drawn.filter((o) => !part.has(o));
             for (const o of hidden) o.visible = false;
             const prevTarget = renderer.getRenderTarget();
+            const prevAutoClear = renderer.autoClear;
             try {
               renderer.setRenderTarget(postFx.renderTarget());
+              renderer.autoClear = true;
               renderer.render(scene, camera);
             } finally {
+              renderer.autoClear = prevAutoClear;
               renderer.setRenderTarget(prevTarget);
               for (const o of hidden) o.visible = true;
             }
