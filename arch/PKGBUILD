@@ -1,0 +1,69 @@
+# Maintainer: LibreCorsa Offline Contributors
+pkgname=librecorsa-offline
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Air-gapped offline motorsport & physics simulator (uses system Electron)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/nates-lobster/libre-corsa-offline"
+license=('AGPL-3.0-or-later')
+depends=('electron')
+makedepends=('nodejs' 'npm')
+optdepends=(
+  'vulkan-icd-loader: hardware-accelerated WebGL/Vulkan rendering'
+  'pipewire-alsa: low-latency audio synthesis'
+)
+# Local checkout packaging: run `makepkg -si` from the `arch/` directory after cloning the repo.
+source=()
+sha256sums=()
+
+_repo_root() {
+  cd "${startdir}/.." && pwd
+}
+
+build() {
+  local root
+  root="$(_repo_root)"
+  cd "${root}"
+  if [ ! -d node_modules ]; then
+    npm ci
+  fi
+  npm run build
+}
+
+check() {
+  local root
+  root="$(_repo_root)"
+  cd "${root}"
+  npm run desktop:test
+}
+
+package() {
+  local root appdir
+  root="$(_repo_root)"
+  appdir="${pkgdir}/usr/lib/${pkgname}"
+
+  # Desktop shell (zero bundled Chromium / zero npm deps)
+  install -dm755 "${appdir}/src"
+  install -m644 "${root}/desktop/package.json" "${appdir}/package.json"
+  install -m644 "${root}/desktop/src/"*.js "${appdir}/src/"
+
+  # Built static simulator bundle (HTML, JS, CSS, local fonts, circuits, cars, audio, basis transcoder)
+  install -dm755 "${appdir}/web"
+  cp -a "${root}/out/." "${appdir}/web/"
+
+  # Launcher script
+  install -Dm755 "${startdir}/librecorsa-offline.sh" "${pkgdir}/usr/bin/${pkgname}"
+
+  # Desktop entry & icon
+  install -Dm644 "${startdir}/librecorsa-offline.desktop" "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+  install -Dm644 "${root}/desktop/build/icon.png" "${pkgdir}/usr/share/icons/hicolor/512x512/apps/${pkgname}.png"
+  install -Dm644 "${root}/public/branding/librecorsa-mark.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/${pkgname}.svg"
+
+  # WebHID udev rules for steering wheels (Logitech, Thrustmaster, Fanatec, Moza) & DualSense/DS4
+  install -Dm644 "${startdir}/99-librecorsa-wheels.rules" "${pkgdir}/usr/lib/udev/rules.d/99-librecorsa-wheels.rules"
+
+  # License & notices
+  install -Dm644 "${root}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${root}/CREDITS.md" "${pkgdir}/usr/share/doc/${pkgname}/CREDITS.md"
+  install -Dm644 "${root}/THIRD_PARTY_NOTICES.md" "${pkgdir}/usr/share/doc/${pkgname}/THIRD_PARTY_NOTICES.md"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "librecorsa-offline-desktop",
+  "version": "0.2.0",
+  "description": "LibreCorsa Offline native desktop shell (air-gapped Electron for Windows, Arch Linux, and macOS)",
+  "main": "src/main.js",
+  "author": "LibreCorsa",
+  "license": "AGPL-3.0-or-later",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/main.js && node --check src/local-server.js && node --check src/hid-policy.js && node --check src/nav-policy.js && node --check src/windows-gpu.js && npm test"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0"
+  }
+}

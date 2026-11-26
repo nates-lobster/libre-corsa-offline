@@ -1,0 +1,454 @@
+/**
+ * What the simulator, the AI field and the renderer need from the player's car. Implemented by the LC26
+ * model (`F1Physics2026`) and by the f12026-car adapter (`F12026CarSim`), so either can be driven.
+ */
+import type { ChassisSetup } from './car-setup';
+import type * as THREE from 'three';
+import type {
+  ActiveAeroMode,
+  AeroSetupPreset,
+  CarTelemetry,
+  ControlInputs,
+  DriverAssistPreset,
+  LiveTunerPatch,
+  LiveTunerState,
+  TireCompound,
+  TrackSamplePoint,
+  TyreSetup,
+} from '@/types/f1';
+import type { VehicleWheelState } from './vehicle-types';
+import { createGroundHit, type GroundHit, type GroundQuery, type TrackSurfaceKind } from './f12026-car/TrackColliderQuery';
+import type { SteeringAssistSettings, SteeringSource } from './steering-assist';
+import type { BrakingGuide } from './speed-profile';
+
+/** Per-wheel state used by the skid marks / smoke, multiplayer and AI peers. Order FR, FL, RR, RL. */
+export type SimulatorWheel = Pick<
+  VehicleWheelState,
+  'worldPos' | 'zRoad' | 'fzN' | 'combinedSlipNorm' | 'slideSpeedMs' | 'lockShare' | 'surfaceType' | 'spinVel'
+>;
+
+/** Per-corner tyre state for the GPU tyre deformation (order FR, FL, RR, RL). Updated in place each step. */
+export interface TyreVisualState {
+  /** Loaded radius R_unloaded − δ (m) */
+  loadedRadiusM: number;
+  /** Radial deflection δ = Fz / radial rate (m) */
+  verticalDeflectionM: number;
+  /** Lateral tyre force in the wheel frame (N, + left) */
+  lateralForceN: number;
+  /**
+   * Camber leaning toward +left relative to the road (rad). Not drawn: the drawn tyre's camber is its wheel model's
+   * own orientation against the road (`corner-rig.ts`)
+   */
+  camberRad: number;
+  /**
+   * Carcass deflection of the relaxation-length tyre model (m, wheel frame), in its own sign convention: x + while the
+   * tyre drives (rim faster than the road, Fx +), y + while the contact slides toward +left (Fy −, so the tread is
+   * pulled toward −left). Only the elastic part: past the grip peak (normalised combined slip > 1) the states are
+   * scaled back to the peak's, the rest being sliding. Absent (a replayed or remote car): the renderer falls back to
+   * `lateralForceN` for the lateral shear and draws no wind-up.
+   */
+  carcassDeflectionXM?: number;
+  carcassDeflectionYM?: number;
+  /**
+   * Bottom of the tyre in the car frame (`worldPosition` / `worldQuaternion`, m): the road under a tyre `onRoad`, the
+   * hub less the unloaded radius for a tyre off the ground. On the rigid-body model the car frame rides on the sprung
+   * body, so the rigs put the unsprung wheels here rather than carrying them with the body's heave, pitch and roll;
+   * a tyre on the road is then seated on the car's ground under the model's own corner (`seatCorner`). Absent: the
+   * car frame's origin plane is the road under the wheels.
+   */
+  contactInCar?: { x: number; y: number; z: number };
+  /**
+   * The tyre stands on the road: its contact is the road under it, and the rigs seat it on the car's ground under
+   * the model's own corner (`seatCorner`). False for a rigid-body tyre off the ground, which hangs at `contactInCar`.
+   * The LC26 draws no wheel travel (its body moves on the rig, its wheels stay on the road), so its tyres always do.
+   */
+  onRoad: boolean;
+}
+
+export interface SimulatorCar {
+  readonly telemetry: CarTelemetry;
+  /** Ground-level origin of the car model and its orientation (model axes: +X left, +Y up, +Z forward) */
+  readonly worldPosition: THREE.Vector3;
+  readonly worldQuaternion: THREE.Quaternion;
+  /** True 3D world-space linear velocity (m/s) at the car origin, including vertical velocity on slopes */
+  readonly worldVelocity?: THREE.Vector3;
+  /** Fixed-step models: simulated time not yet stepped this frame (s); the pose is drawn carried forward by it */
+  readonly renderLeadS?: number;
+  readonly wheels: readonly [SimulatorWheel, SimulatorWheel, SimulatorWheel, SimulatorWheel];
+  /** Optional visual tyre state per corner (FR, FL, RR, RL) for the GPU tyre deformation */
+  readonly tyreVisuals?: readonly [TyreVisualState, TyreVisualState, TyreVisualState, TyreVisualState];
+  /**
+   * The track collider the car drives on, for reading only (the rigs seat the drawn wheels on it, `seatCorner`);
+   * null / absent while the car is on the track samples' ground
+   */
+  readonly groundQuery?: GroundQuery | null;
+  readonly wheelbaseM: number;
+  /** Static height of the centre of gravity above the ground (m) */
+  readonly cgHeightM: number;
+  readonly maxSteerAngleRad: number;
+  /** Mass (kg) and yaw inertia (kg·m²) for car-to-car contact (absent: an F1 car's) */
+  readonly contactMassKg?: number;
+  readonly contactYawInertiaKgM2?: number;
+  /** The car's own braking guidance for the braking line (absent / null: the circuit's LC26 profile) */
+  readonly brakingGuide?: BrakingGuide | null;
+
+  /** Track distance (m) and signed offset from the centreline (m, + right); writable to move the car */
+  sMeters: number;
+  lateralOffsetM: number;
+  /** Body longitudinal velocity (m/s); writable */
+  vxMs: number;
+  /** Body lateral velocity (m/s, + left) */
+  readonly vyMs: number;
+  /** Yaw rate (rad/s, + = turning right) */
+  readonly yawRateRadS: number;
+  /** Steering −1..1, + = right */
+  readonly steerAngleNorm: number;
+  /** Extra chassis pitch / roll / heave applied to the rig on top of `worldQuaternion` */
+  readonly pitchRad: number;
+  readonly rollRad: number;
+  readonly rideHeightOffsetM: number;
+  readonly wheelRotationRad: number;
+  readonly ersEnergyJ: number;
+
+  /** Identifier of this vehicle model (derived from the car's profile) */
+  readonly vehicleId?: import('@/types/f1').VehicleModelId;
+  /** Racing line family used by this car ('f1' | 'gt3') */
+  readonly racingLineId?: 'f1' | 'gt3';
+  aiAutopilot: boolean;
+  /** Fraction of the car's limit speed the autopilot runs at */
+  aiPaceScale?: number;
+  /** A car that plans its autopilot speeds on its tyres' grip on this road (0.05 steps); the weather pace then leaves it be */
+  aiPlanGrip?(): number;
+  /** Traffic lateral offset bias from the racing line (m) */
+  aiLineBiasM?: number;
+  /** Traffic speed cap (m/s) */
+  aiSpeedCapMs?: number;
+  /**
+   * A plan's level-ground top speed is no limit to this car: in a tow it runs past it, held by its own drag (the race
+   * field sets it unless the driver is told to lift, under a yellow or a blue flag)
+   */
+  aiTopSpeedOpen?: boolean;
+  /** AI tuning: target speed along the lap replacing the autopilot's own limit profile (m/s, uniform spacing) */
+  aiTargetSpeedMs?: Float64Array | null;
+  /** A plan for the autopilot to track as given (`ai/drive-plan.ts`); null: its own line and limit profile */
+  aiPlan?: import('./ai/drive-plan').AiDrivePlan | null;
+  /** AI tuning: steering gain multiplier of the autopilot */
+  aiSteerGain?: number;
+  /** The autopilot's own limit speed along the lap (m/s, uniform spacing), which AI tuning scales */
+  aiBaseSpeedProfile?(): ArrayLike<number>;
+  aeroPreset: AeroSetupPreset;
+  assistPreset: DriverAssistPreset;
+  /** The controller's stick goes through the steering assist (off = raw stick to the rack); the keyboard always does */
+  gamepadAssistEnabled: boolean;
+  /** Automatic gear changes; off = the driver shifts with Gear up / Gear down (AI cars keep it on) */
+  autoGearbox: boolean;
+  /** Automatic clutch & anti-stall (default true); false with manual gears enables bite point, clutch slip and stalls */
+  autoClutch: boolean;
+  /** Keyboard and controller steering assist (its settings follow the player's tuning) and what steered last */
+  readonly steeringAssist: { settings: SteeringAssistSettings; readonly source: SteeringSource | null };
+  autoXMode: boolean;
+  /** A 2026 F1 car uses the Overtake earned in a race by itself (the player's Automatic Overtake) */
+  autoOvertake?: boolean;
+  activeAeroMode: ActiveAeroMode;
+  tireCompound: TireCompound;
+
+  /** Advance by a render frame */
+  step(dtSeconds: number, inputs: Partial<ControlInputs>): unknown;
+  /**
+   * `fieldSize`: a race's rolling start, every car of the field at one speed (`rollingStartSpeedMs`). `raceStart`: a
+   * race's grid, after its formation lap (warm tyres and brakes), not a car out of the garage
+   */
+  resetToStartGrid(flyingStart?: boolean, gridSlot?: number, fieldSize?: number, raceStart?: boolean): void;
+  teleportToDistance(sMeters: number, speedMs?: number, lateral?: number): void;
+  teleportToTurn(turnNumber: number): void;
+  /**
+   * Puts the car back at a recorded pose (world x, z and heading, + yaw = atan2(forward.x, forward.z)),
+   * on the ground and rolling at `speedMs`, keeping the tyres' heat and wear. `s` is a hint for the track projection.
+   */
+  restorePose?(pose: { x: number; z: number; yawRad: number; speedMs: number; s?: number; lapCount?: number; outLap?: boolean }): void;
+  getTyreSetup(): TyreSetup;
+  setTyreSetup(setup: TyreSetup): void;
+  activateBoostOverride(): boolean;
+  /** Race control for the overtaking aids (the 1 s and lap rules, `overtaking-rules.ts`); null = practice, free use */
+  raceControl?: import('./overtaking-rules').OvertakingRaceControl | null;
+  /** The car's overtaking aids (absent: none, e.g. a GT3) */
+  readonly overtakingRules?: import('./overtaking-rules').OvertakingRules;
+  /** Set the overtaking aids of the car's era (a 2026-model car standing in for an older one) */
+  setOvertakingRules?(rules: import('./overtaking-rules').OvertakingRules): void;
+  /** Instantiate an AI opponent car of the exact same vehicle model & profile */
+  createAiPeerCar?(): SimulatorCar;
+  /** Attach loaded 3D track collider root */
+  attachTrackRoot?(root: THREE.Object3D): void;
+  /** Track limits: 'strict' (any excursion deletes the lap) or 'judged' by race control (`TrackLimitsMonitor`) */
+  trackLimitsMode?: 'strict' | 'judged';
+  /** Judged mode: an excursion is being judged; a lap completed meanwhile does not count */
+  trackLimitsHold?: boolean;
+  /** A manual start's lights: the car held on the grid, its engine live (`race-start.ts`) */
+  gridHold?: boolean;
+  /** Race control deleted the running lap */
+  invalidateLap?(): void;
+  /** Garage chassis setup (wing trim, ride height, springs, bars, dampers) as offsets from the car's baseline */
+  getChassisSetup?(): ChassisSetup;
+  applyChassisSetup?(setup: ChassisSetup): void;
+  /** Read or update the live in-race MFD tuner state */
+  getLiveTunerState?(): LiveTunerState;
+  setLiveTuner?(patch: LiveTunerPatch): void;
+
+  /** Apply the car's damage (`car-damage.ts`): aero, per-wheel grip and toe, engine; null = undamaged */
+  setDamageEffects?(effects: Readonly<import('./car-damage').CarDamageEffects> | null): void;
+  /** The car puts itself back on the line when stuck on autopilot (default true; a race field rejoins its own cars) */
+  aiSelfRecovery?: boolean;
+  /** Apply trailing vortex wake / slipstream deficit from cars ahead */
+  setAeroWakeState?(wake: import('./aero-wake').AeroWakeState): void;
+  /** Apply the dynamic track evolution sample under the car */
+  setTrackEvolutionSample?(sample: import('./track-evolution').TrackEvolutionSample): void;
+  /** Apply the weather under the car: water on the road, air temperature (`weather.ts`) */
+  setWeatherSample?(sample: import('./weather').WeatherContactSample): void;
+  /** Simulation realism level's switches (tyre wear, temperature grip, fuel use, wet severity) */
+  setSimRealism?(flags: import('./sim-realism').SimRealismFlags): void;
+  /** A time trial is driven (true) or practice (false): a 2026 F1 car's energy allowances (qualifying's or practice's) */
+  setEnergySession?(timeTrial: boolean): void;
+  /** An AI car that fits the tyres the weather calls for (`TrackEnvironment` swaps them) */
+  aiAutoTyres?: boolean;
+  /**
+   * Apply a car-to-car contact resolved by `resolveCarToCarObbCollision` (Three.js world, Y up), as deltas:
+   * `posDeltaX/Z` move the car (m), `velDeltaX/Z` change its world horizontal velocity (m/s) and `yawRateDeltaRadS`
+   * its yaw rate about +Y (rad/s, + = counter-clockwise from above, i.e. turning left; note `yawRateRadS` is + right).
+   * The caller clamps the deltas per frame.
+   */
+  applyRigidBodyCollision?(
+    posDeltaX: number,
+    posDeltaZ: number,
+    velDeltaX: number,
+    velDeltaZ: number,
+    yawRateDeltaRadS: number
+  ): void;
+}
+
+/** A flying lap's run-up is this long where the final straight allows it (m) */
+const FLYING_RUN_UP_M = 450;
+/** Slower than this (the circuit's speed profile, km/h) a stretch counts as the last corner, not the straight */
+const FLYING_CORNER_KMH = 200;
+
+/** Acceleration a flying start assumes out of the last corner (m/s²) */
+const FLYING_EXIT_ACCEL = 0.5 * 9.81;
+
+/**
+ * Where a flying lap starts (`s`, m along the lap): 450 m before the line, or 20 m past the exit of the last
+ * corner (`cornerS`: the last point of the speed profile under 200 km/h) where the final straight is shorter
+ * (Shanghai, Suzuka), so no car is dropped into a corner with no yaw rate. Never closer than 40 m to
+ * the line. `cornerS` is null on a full-length run-up.
+ */
+export function flyingStartPoint(track: {
+  totalLengthM: number;
+  getSampleAtDistance(s: number): { optimalSpeedKmh: number };
+}): { s: number; cornerS: number | null } {
+  const L = track.totalLengthM;
+  let straight = 0;
+  for (let d = 5; d <= FLYING_RUN_UP_M; d += 5) {
+    if (track.getSampleAtDistance(L - d).optimalSpeedKmh < FLYING_CORNER_KMH) break;
+    straight = d;
+  }
+  if (straight >= FLYING_RUN_UP_M) return { s: L - FLYING_RUN_UP_M, cornerS: null };
+  return { s: L - Math.max(40, straight - 20), cornerS: L - straight - 5 };
+}
+
+/** Speed (m/s) a car leaving the last corner at `exitMs` carries `distanceM` further on */
+export function flyingExitSpeedMs(exitMs: number, distanceM: number): number {
+  return Math.sqrt(exitMs * exitMs + 2 * FLYING_EXIT_ACCEL * Math.max(0, distanceM));
+}
+
+/**
+ * A car put down at speed for a flying lap has no yaw rate and its wheel straight, so it runs straight on until its
+ * driver reacts: for this long (s) its tyres must stay on the asphalt with no help (`startPose`)
+ */
+export const START_HANDS_OFF_S = 1;
+/** What those tyres may run on: the road and its kerbs, not run-off, gravel, grass, sausage kerbs or the pit lane */
+const START_SURFACES: ReadonlySet<TrackSurfaceKind> = new Set(['road', 'kerb']);
+/** Spacing of the checks along that run (m) */
+const START_RUN_STEP_M = 2;
+/** Spacing of the spots `startPose` tries across the road (m) */
+const START_LATERAL_STEP_M = 0.25;
+/**
+ * Furthest `startPose` turns a car off the road's heading (rad) or moves it off its line (m) to keep its tyres on.
+ * A start that needs more is in a corner (VIR Patriot's: 100 m radius at 185 km/h, where only a car turned 24° and
+ * moved 7 m across the road kept them on for a second), and stays on its line along the road
+ */
+const START_MAX_TURN_RAD = (10 * Math.PI) / 180;
+const START_MAX_SHIFT_M = 2;
+
+/** A car's tyres for `startPose`: their outer edges either side of its centre, its axles ahead of and behind it (m) */
+export interface StartFootprint {
+  halfWidthM: number;
+  frontM: number;
+  rearM: number;
+}
+
+/** Where a car starts: world x / z, heading (rad, `atan2` of its forward x and z) and its offset right of the centreline (m) */
+export interface StartPose {
+  x: number;
+  z: number;
+  yawRad: number;
+  lateral: number;
+}
+
+interface StartTrack {
+  getSampleAtDistance(s: number): Pick<TrackSamplePoint, 'position' | 'tangent' | 'binormal'>;
+}
+
+/** The point `lateral` m right of the centreline at `s`, across the road as a car is placed (`binormal` flattened) */
+function pointAcross(track: StartTrack, s: number, lateral: number): [number, number] {
+  const smp = track.getSampleAtDistance(s);
+  const b = smp.binormal;
+  const bl = Math.hypot(b.x, b.z) || 1;
+  return [smp.position.x + (b.x / bl) * lateral, smp.position.z + (b.z / bl) * lateral];
+}
+
+/**
+ * How far (m, up to `runM`) a car at (x, z), `s` along the lap, heading `yawRad`, runs straight on before a tyre's
+ * outer edge leaves the asphalt (`START_SURFACES`), read off the circuit's ground under all four every `START_RUN_STEP_M`
+ */
+function straightRunOnAsphaltM(
+  track: StartTrack,
+  ground: GroundQuery,
+  hit: GroundHit,
+  s: number,
+  pose: StartPose,
+  fp: StartFootprint,
+  runM: number
+): number {
+  const fx = Math.sin(pose.yawRad);
+  const fz = Math.cos(pose.yawRad);
+  let clean = 0;
+  for (let d = 0; d <= runM + 1e-6; d += START_RUN_STEP_M) {
+    // From above the road there: the run stays close to it
+    const probeY = track.getSampleAtDistance(s + d).position.y + 3;
+    for (const along of [fp.frontM, -fp.rearM]) {
+      for (const across of [-fp.halfWidthM, fp.halfWidthM]) {
+        // (-fz, fx) is the car's right, as the binormal is the road's
+        const x = pose.x + fx * (d + along) - fz * across;
+        const z = pose.z + fz * (d + along) + fx * across;
+        if (!ground.query(x, z, probeY, hit) || !START_SURFACES.has(hit.surface)) return clean;
+      }
+    }
+    clean = Math.min(runM, d);
+  }
+  return runM;
+}
+
+/**
+ * Where a car put down at `s` at speed for a flying lap starts, and which way it points (`START_HANDS_OFF_S`). On its
+ * line (`lateral`) heading along the road wherever, from there, its tyres stay on the asphalt for `runM` (m) hands-off,
+ * as on a straight. Where they would not (a short final straight starts on the last corner's exit: at Sachsenring the
+ * road still bends left there and its right edge closes in, and the right-hand tyres were on the run-off 0.3 s after
+ * a flying start), it points at its line `runM` ahead (`aimLateral` there), from `lateral` or from the spot nearest it
+ * within `lo`..`hi` that keeps them on, turned and moved no further than `START_MAX_TURN_RAD` / `START_MAX_SHIFT_M`;
+ * failing every one, it stays on its line along the road. The circuit's ground (its colliders) decides what is
+ * asphalt, not the track data's width. With no `ground` (the track samples' stand-in) the car goes on its line, along
+ * the road
+ */
+export function startPose(
+  track: StartTrack,
+  ground: GroundQuery | null,
+  s: number,
+  lateral: number,
+  aimLateral: (s: number) => number,
+  lo: number,
+  hi: number,
+  footprint: StartFootprint,
+  runM: number
+): StartPose {
+  const tangent = track.getSampleAtDistance(s).tangent;
+  const [x0, z0] = pointAcross(track, s, lateral);
+  const alongRoad: StartPose = { x: x0, z: z0, yawRad: Math.atan2(tangent.x, tangent.z), lateral };
+  if (!ground || !(runM > 0)) return alongRoad;
+  const hit = createGroundHit();
+  const run = (pose: StartPose) => straightRunOnAsphaltM(track, ground, hit, s, pose, footprint, runM);
+  if (run(alongRoad) >= runM) return alongRoad;
+  const [ax, az] = pointAcross(track, s + runM, aimLateral(s + runM));
+  // Nearest the line first, and of two as near, the one nearer the centre
+  const toCentre = lateral > 0 ? -1 : 1;
+  for (let k = 0; k * START_LATERAL_STEP_M <= START_MAX_SHIFT_M + 1e-9; k++) {
+    for (const side of k === 0 ? [0] : [toCentre, -toCentre]) {
+      const lat = lateral + side * k * START_LATERAL_STEP_M;
+      if (k > 0 && (lat < lo || lat > hi)) continue;
+      const [x, z] = pointAcross(track, s, lat);
+      const pose: StartPose = { x, z, yawRad: Math.atan2(ax - x, az - z), lateral: lat };
+      const turn = pose.yawRad - alongRoad.yawRad;
+      if (Math.abs(Math.atan2(Math.sin(turn), Math.cos(turn))) > START_MAX_TURN_RAD) continue;
+      if (run(pose) >= runM) return pose;
+    }
+  }
+  return alongRoad;
+}
+
+/** Gap between grid slots in a flying start's queue (m); the slots alternate sides */
+export const FLYING_SLOT_SPACING_M = 28;
+
+/** A race's rolling start never runs faster than this (m/s): a formation pace, not racing speed */
+export const ROLLING_START_PACE_MS = 120 / 3.6;
+/** No rolling-start slot where the road within 10 m curves tighter than this (1/m: a 33 m radius, a hairpin) */
+const ROLLING_SLOT_MAX_CURVATURE = 0.03;
+/** The most cornering a car placed with no yaw rate is asked for at the field's speed (g) */
+const ROLLING_START_LAT_G = 1;
+
+interface RollingStartTrack {
+  totalLengthM: number;
+  getSampleAtDistance(s: number): { optimalSpeedKmh: number; curvature: number };
+}
+
+/**
+ * Where the first `count` grid slots of a race's rolling start line up (m along the lap): from the flying start's
+ * point back, each 28 m behind the one ahead, or up to 120 m further back past a hairpin, so no car is dropped onto
+ * one's apex with no yaw rate (it spun before it had turned in: where the final straight is short the queue runs
+ * back through the last corner). Gentler corners keep their slots, at the speed `rollingStartSpeedMs` allows there.
+ * The queue skips only within half a lap of the front: on a short, twisty layout it otherwise ran round onto itself
+ */
+export function rollingStartSlots(track: RollingStartTrack, start: { s: number }, count: number): number[] {
+  const L = track.totalLengthM;
+  const wrap = (s: number) => ((s % L) + L) % L;
+  const curved = (s: number) => {
+    for (let d = -10; d <= 10; d += 5) if (Math.abs(track.getSampleAtDistance(wrap(s + d)).curvature) > ROLLING_SLOT_MAX_CURVATURE) return true;
+    return false;
+  };
+  const slots: number[] = [];
+  let s = start.s;
+  for (let slot = 0; slot < count; slot++) {
+    if (slot > 0) {
+      s -= FLYING_SLOT_SPACING_M;
+      for (let back = 0; back < 120 && start.s - s < L / 2 && curved(s); back += 5) s -= 5;
+    }
+    slots.push(wrap(s));
+  }
+  return slots;
+}
+
+/**
+ * The one speed a whole field takes a rolling start at (m/s): the formation pace, or slower where any of its slots
+ * (`rollingStartSlots`) would be. Each slot allows `spotSpeedMs` at its spot, 90 % of the lap's speed there (the
+ * circuit's profile, which is still accelerating out of a corner where the car's grip limit alone would allow far
+ * more), no more than 1 g of cornering and, in or after the last corner, no more than the car carries out of it
+ * (`cornerExitMs` at `start.cornerS`). One speed for every car: each slot once took its own, the leader 188 km/h out
+ * of the last corner and the cars 28 m behind it 270 km/h, and they braked into each other and spun
+ */
+export function rollingStartSpeedMs(
+  track: RollingStartTrack,
+  start: { s: number; cornerS: number | null },
+  fieldSize: number,
+  spotSpeedMs: (s: number) => number,
+  cornerExitMs: number
+): number {
+  const L = track.totalLengthM;
+  let speed = ROLLING_START_PACE_MS;
+  for (const s of rollingStartSlots(track, start, fieldSize)) {
+    const sample = track.getSampleAtDistance(s);
+    speed = Math.min(speed, spotSpeedMs(s), (0.9 * sample.optimalSpeedKmh) / 3.6);
+    speed = Math.min(speed, Math.sqrt((ROLLING_START_LAT_G * 9.81) / Math.max(1e-4, Math.abs(sample.curvature))));
+    if (start.cornerS !== null) {
+      // Signed: a slot before the corner's end is still in it (unsigned, it was a whole lap from leaving it)
+      const d = ((((s - start.cornerS + L / 2) % L) + L) % L) - L / 2;
+      speed = Math.min(speed, flyingExitSpeedMs(cornerExitMs, d));
+    }
+  }
+  return speed;
+}
