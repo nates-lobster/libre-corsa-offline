@@ -1,0 +1,483 @@
+import * as THREE from "three";
+import { createGltfLoader } from "@/lib/render/gltf-loader";
+import { cleanGt3Material, sharpenCarMaps } from "@/lib/render/ported-car-materials";
+import { assetProgress, type AssetTaskId } from "@/lib/loading/asset-progress";
+import { withBasePath } from "@/lib/base-path";
+import { AMG_GT3_CONFIG } from "@/lib/sim/gt3/AmgGt3Config";
+import type { CarTelemetry, LiveryConfig, TireCompound } from "@/types/f1";
+import type { SimCarRig } from "@/lib/car-builder-2026";
+import type { Lc26CameraAnchor, Lc26ModelInstance } from "@/lib/lc26-car-model";
+import { installTyreDeformation, type TyreDeformationHandle } from "@/lib/render/tyre-deformation";
+import { applyLivery, collectPaintSlots, type PaintKeys, type PaintSlot } from "@/lib/render/livery-repaint";
+import {
+  relativeMatrix,
+  updateCorners,
+  WHEEL_NODES,
+  WHEEL_SIDES,
+  type RigCorner,
+  type WheelSeating,
+} from "@/lib/render/corner-rig";
+import { singlePassTransparency } from "@/lib/render/static-scene";
+
+/** Body paint material of the GT3 GLB and its factory colours (orange body, black graphics) */
+const GT3_PAINT_MATERIAL = "amgMercedesAMG_GT3_2020Paint_Material1";
+const GT3_PAINT_KEYS: PaintKeys = {
+  primary: ["#ff6700"],
+  secondary: ["#0d0d0d"],
+};
+
+/**
+ * Mercedes-AMG GT3 3D model (`public/gt3/model/amg_gt3.glb`) and cockpit (`public/gt3/model/amg_gt3_cockpit.glb`).
+ * Without the exterior file the rig shows a plain placeholder body; when the cockpit file loads, its CABIN,
+ * STEER pivot, shift lights and TC / ABS indicators replace the exterior model's static interior meshes.
+ *
+ * Model space: +X left, +Y up, +Z forward, floor at y = 0 (the rig's axes). Node layout:
+ *   GT3 (extras: wheelCentres, tyreRadius, tyreHalfWidth)
+ *     BODY        body, interior, glass and lights (sprung)
+ *     WHEEL_xx    hub pivot with the authored camber; children WHEEL_xx_RIM / WHEEL_xx_TYRE
+ *     SUSP_xx     brake callipers (steer with the wheel, do not spin)
+ */
+const MODEL_URL = "/gt3/model/amg_gt3.glb";
+const COCKPIT_URL = "/gt3/model/amg_gt3_cockpit.glb";
+/**
+ * Source-model meshes replaced by the ported cockpit (steering wheel, seat, belts, roll cage, dash, centre console).
+ * GLTFLoader sanitises node names, so these are matched after the same sanitising ("amg:Interior_Geo" loads as
+ * "amgInterior_Geo").
+ */
+const SOURCE_INTERIOR = ["amg:Interior_Geo", "amg:SeatBelt_Geo", "amg:Carbon1Details_Geo", "uv2:Carbon1Details_Geo"].map(
+  (name) => THREE.PropertyBinding.sanitizeNodeName(name)
+);
+
+interface CockpitExtras {
+  leds?: { name: string; rpm: number; emissive: [number, number, number] }[];
+  ledBlinkRpm?: number;
+  steerLockDeg?: number;
+}
+
+const WHEELS = WHEEL_NODES;
+const SIDE = WHEEL_SIDES;
+
+interface Gt3Extras {
+  wheelCentres?: Record<string, [number, number, number]>;
+  tyreRadius?: Record<string, number>;
+  tyreHalfWidth?: Record<string, number>;
+}
+
+let templatePromise: Promise<THREE.Group | null> | null = null;
+let cockpitPromise: Promise<THREE.Group | null> | null = null;
+
+/** The ported cockpit (null when the file is absent: the source model's interior stays) */
+export function loadGt3Cockpit(): Promise<THREE.Group | null> {
+  if (!cockpitPromise) {
+    cockpitPromise = (async () => {
+      if (typeof window === "undefined") return null;
+      const url = withBasePath(COCKPIT_URL);
+      try {
+        const head = await fetch(url, { method: "HEAD" });
+        if (!head.ok) return null;
+        const scene = (await createGltfLoader().loadAsync(url)).scene;
+        scene.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          const std = mesh.material as THREE.MeshStandardMaterial;
+          if (std.map) std.map.anisotropy = 8;
+          if (std.transparent) std.depthWrite = false;
+          singlePassTransparency(std);
+        });
+        scene.updateMatrixWorld(true);
+        return scene;
+      } catch (err) {
+        console.warn("GT3 cockpit not loaded, keeping the model's own interior", err);
+        return null;
+      }
+    })();
+  }
+  return cockpitPromise;
+}
+
+/**
+ * Re-bases each wheel so its node origin is the tread centre and its axes are unmirrored (the source model's
+ * right wheels are the left ones turned 180° about Y). The tyre deformation shader expects that frame: tread
+ * centred on x = 0, spinning about +X. Done once on the template; the rim and tyre share one vertex buffer.
+ */
+function rebaseWheels(scene: THREE.Group, extras: Gt3Extras): void {
+  const done = new Set<THREE.BufferAttribute | THREE.InterleavedBufferAttribute>();
+  const normalMatrix = new THREE.Matrix3();
+  for (const side of SIDE) {
+    const wheel = scene.getObjectByName(`WHEEL_${side}`);
+    const centre = extras.wheelCentres?.[`WHEEL_${side}`];
+    if (!wheel || !centre) continue;
+    wheel.updateMatrix();
+    const local = wheel.matrix.clone();
+    // Tread centre in the wheel's own frame (the parent GT3 node is unrotated)
+    const mid = new THREE.Vector3(...centre).applyMatrix4(local.clone().invert());
+    const flipped = new THREE.Vector3(1, 0, 0).applyMatrix4(new THREE.Matrix4().extractRotation(local)).x < 0;
+    // G maps the authored wheel frame to the re-based one; the node absorbs its inverse
+    const G = new THREE.Matrix4().makeTranslation(-mid.x, -mid.y, -mid.z);
+    if (flipped) G.premultiply(new THREE.Matrix4().makeRotationY(Math.PI));
+    normalMatrix.getNormalMatrix(G);
+    for (const child of wheel.children) {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh) continue;
+      const geo = mesh.geometry;
+      const pos = geo.getAttribute("position");
+      if (!done.has(pos)) {
+        done.add(pos);
+        pos.applyMatrix4(G);
+        pos.needsUpdate = true;
+      }
+      const nrm = geo.getAttribute("normal");
+      if (nrm && !done.has(nrm)) {
+        done.add(nrm);
+        nrm.applyNormalMatrix(normalMatrix);
+        nrm.needsUpdate = true;
+      }
+      const tan = geo.getAttribute("tangent");
+      if (tan && !done.has(tan)) {
+        done.add(tan);
+        tan.transformDirection(G);
+        tan.needsUpdate = true;
+      }
+    }
+    local.multiply(G.clone().invert());
+    local.decompose(wheel.position, wheel.quaternion, wheel.scale);
+  }
+  // Bounds after the rewrite (shared buffers: every geometry re-reads the moved vertices)
+  scene.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.name.startsWith("WHEEL_")) return;
+    mesh.geometry.computeBoundingBox();
+    mesh.geometry.computeBoundingSphere();
+  });
+}
+
+/** `task`: the loading-screen task its download counts toward (the player's car, or the opponents' when it differs) */
+export function loadGt3Template(task: AssetTaskId = "car"): Promise<THREE.Group | null> {
+  if (!templatePromise) {
+    templatePromise = (async () => {
+      if (typeof window === "undefined") return null;
+      const url = withBasePath(MODEL_URL);
+      assetProgress.begin(task);
+      try {
+        const gltf = await createGltfLoader().loadAsync(url, (event) => assetProgress.progress(task, event));
+        const scene = gltf.scene;
+        const extras = (scene.getObjectByName("GT3")?.userData ?? {}) as Gt3Extras;
+        rebaseWheels(scene, extras);
+        scene.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          for (const m of mats) {
+            const std = m as THREE.MeshStandardMaterial;
+            cleanGt3Material(m);
+            sharpenCarMaps(m);
+            if (std.transparent) std.depthWrite = false;
+            singlePassTransparency(std);
+          }
+        });
+        scene.updateMatrixWorld(true);
+        assetProgress.done(task);
+        return scene;
+      } catch (err) {
+        console.warn("GT3 model not loaded, using the placeholder body", err);
+        assetProgress.fail(task);
+        return null;
+      }
+    })();
+  }
+  return templatePromise;
+}
+
+
+const anchor = (pos: [number, number, number], pitchDeg: number, fovDeg: number): Lc26CameraAnchor => ({
+  pos: new THREE.Vector3(...pos),
+  pitchRad: pitchDeg * THREE.MathUtils.DEG2RAD,
+  fovDeg,
+});
+
+/**
+ * Onboard cameras in model space, aligned with the left-hand driver seat and roof/bonnet mounts.
+ */
+const CAMERAS: Lc26ModelInstance["cameraAnchors"] = {
+  cockpit: anchor([0.403, 0.955, -0.58], -4.17, 60),
+  // Behind and inboard of the driver's head, under the roof
+  shoulder: anchor([0.12, 1.05, -0.95], -6, 62),
+  // Roof pod above the windscreen header
+  tcam: anchor([0, 1.42, -0.35], -7, 58),
+  dash: anchor([0.38, 0.86, -0.15], -3, 58),
+  // On the bonnet, ahead of the windscreen
+  bumper: anchor([0, 0.98, 0.95], -3, 60),
+  nearChase: anchor([0, 1.9, -5.5], -10, 60),
+  farChase: anchor([0, 2.4, -7.5], -10, 60),
+};
+
+/** The AMG GT3 GLB's wheel centres and front tyre radius (its `GT3` node extras), for rigs that don't load it */
+const GT3_MODEL_WHEELS: Gt3Extras = {
+  wheelCentres: { WHEEL_LF: [0.8634, 0.342, 1.4], WHEEL_LR: [0.8656, 0.3557, -1.2285] },
+  tyreRadius: { LF: 0.34 },
+};
+
+/** Model → rig translation: the model's axle midpoint on the physics' (rig origin = CG on the ground), tyres on it */
+function gt3ModelOffset(extras: Gt3Extras): THREE.Vector3 {
+  const chassis = AMG_GT3_CONFIG.chassis;
+  const lf = extras.wheelCentres?.WHEEL_LF ?? GT3_MODEL_WHEELS.wheelCentres!.WHEEL_LF;
+  const lr = extras.wheelCentres?.WHEEL_LR ?? GT3_MODEL_WHEELS.wheelCentres!.WHEEL_LR;
+  const physicsMidZ = chassis.wheelbase * (0.5 - chassis.frontWeightFraction);
+  return new THREE.Vector3(0, (extras.tyreRadius?.LF ?? 0.34) - lf[1], physicsMidZ - 0.5 * (lf[2] + lr[2]));
+}
+
+function cameraAnchorsAt(offset: THREE.Vector3): Lc26ModelInstance["cameraAnchors"] {
+  const anchors = {} as Lc26ModelInstance["cameraAnchors"];
+  for (const [key, c] of Object.entries(CAMERAS) as [keyof typeof CAMERAS, Lc26CameraAnchor][]) {
+    anchors[key] = { pos: c.pos.clone().add(offset), pitchRad: c.pitchRad, fovDeg: c.fovDeg };
+  }
+  return anchors;
+}
+
+/** Centre of the AMG GT3 cockpit's steering wheel (its `STEER` meshes' box) in model space */
+const GT3_STEER_CENTRE: [number, number, number] = [0.403, 0.729, -0.04];
+
+/** Where a ported GT3's driver and nose sit, in rig space: what its cameras are placed against */
+export interface Gt3CameraFit {
+  /** Centre of the car's steering wheel (null: the model has none) */
+  steerCentre: THREE.Vector3 | null;
+  /** Front axle line (z) */
+  frontAxleZ: number;
+}
+
+/** Cameras that ride with the driver (eye point, shoulder, dash, roof pod) rather than with the nose */
+const DRIVER_CAMERAS = new Set<string>(["cockpit", "shoulder", "dash", "tcam"]);
+
+/**
+ * The AMG GT3's onboard and chase cameras in rig space (the frame every car on the GT3 vehicle model shares). Given a
+ * ported GT3's `fit`, its views are framed as the original car's: the eye point, shoulder, dash and roof cameras keep
+ * their place relative to that car's own steering wheel (the roof pod stays on the centre line), the bonnet camera
+ * its place behind the front axle, and the chase cameras stay put. Without, the AMG's positions as they are.
+ */
+export function gt3RigCameraAnchors(fit?: Gt3CameraFit): Lc26ModelInstance["cameraAnchors"] {
+  const offset = gt3ModelOffset(GT3_MODEL_WHEELS);
+  const anchors = cameraAnchorsAt(offset);
+  if (!fit) return anchors;
+  const driverShift = fit.steerCentre
+    ? fit.steerCentre.clone().sub(new THREE.Vector3(...GT3_STEER_CENTRE).add(offset))
+    : new THREE.Vector3();
+  const noseShift = fit.frontAxleZ - (GT3_MODEL_WHEELS.wheelCentres!.WHEEL_LF[2] + offset.z);
+  for (const [key, a] of Object.entries(anchors)) {
+    if (DRIVER_CAMERAS.has(key)) {
+      a.pos.add(key === "tcam" ? new THREE.Vector3(0, driverShift.y, driverShift.z) : driverShift);
+    } else if (key === "bumper") {
+      a.pos.z += noseShift;
+    }
+  }
+  return anchors;
+}
+
+/** A box the size of the car, shown while (or instead of, when the GLB is missing) the model loads */
+function placeholderBody(): THREE.Mesh {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1.95, 0.9, 4.6),
+    new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.6, roughness: 0.4 })
+  );
+  mesh.position.y = 0.6;
+  mesh.castShadow = true;
+  return mesh;
+}
+
+/**
+ * The GT3's car rig: model body in `chassisGroup` (sprung), wheels and callipers on per-corner steer pivots under
+ * `root` (unsprung), aligned so the model's axles sit on the physics axles.
+ */
+export function createGt3CarRig(): SimCarRig {
+  const root = new THREE.Group();
+  root.name = "GT3_RIG";
+  const chassisGroup = new THREE.Group();
+  root.add(chassisGroup);
+  const placeholder = placeholderBody();
+  chassisGroup.add(placeholder);
+
+  const chassis = AMG_GT3_CONFIG.chassis;
+  const maxRoadWheelRad = chassis.maxRoadWheelDeg * THREE.MathUtils.DEG2RAD;
+  let cameraAnchors: Lc26ModelInstance["cameraAnchors"] | null = null;
+
+  const corners: RigCorner[] = [];
+  let compound: TireCompound = "medium";
+  let disposed = false;
+
+  // Cockpit parts driven from the telemetry (set once the cockpit model is attached)
+  let steerPivot: THREE.Object3D | null = null;
+  const steerRest = new THREE.Quaternion();
+  let steerLockRad = 0;
+  interface Led {
+    material: THREE.MeshStandardMaterial;
+    rpm: number;
+  }
+  const leds: Led[] = [];
+  let ledBlinkRpm = Infinity;
+  const indicators: Partial<Record<"abs" | "tc" | "tcLed" | "limiter", THREE.Object3D>> = {};
+  // Livery: asked for before the model loads, applied once it is in
+  let currentLivery: LiveryConfig | null = null;
+  let paintSlots: PaintSlot[] = [];
+
+  void Promise.all([loadGt3Template(), loadGt3Cockpit()]).then(([template, cockpitTemplate]) => {
+    if (!template || disposed) return;
+    const model = template.clone(true);
+    model.updateMatrixWorld(true);
+    const gt3 = model.getObjectByName("GT3") ?? model;
+    const extras = (gt3.userData ?? {}) as Gt3Extras;
+    const find = (name: string) => model.getObjectByName(name);
+
+    const offset = gt3ModelOffset(extras);
+
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = "GT3_BODY";
+    bodyGroup.position.copy(offset);
+
+    WHEELS.forEach((wheelName, i) => {
+      const wheel = find(wheelName);
+      if (!wheel) return;
+      const wheelBind = relativeMatrix(wheel, gt3);
+      const centre = new THREE.Vector3().setFromMatrixPosition(wheelBind);
+      const steer = new THREE.Group();
+      steer.name = `GT3_STEER_${SIDE[i]}`;
+      steer.position.copy(centre).add(offset);
+      const pivotInv = new THREE.Matrix4().makeTranslation(-centre.x, -centre.y, -centre.z);
+
+      const calliper = find(`SUSP_${SIDE[i]}`);
+      if (calliper) {
+        pivotInv.clone().multiply(relativeMatrix(calliper, gt3)).decompose(calliper.position, calliper.quaternion, calliper.scale);
+        steer.add(calliper);
+      }
+      // Wheel node keeps its camber; rim and tyre spin about its local X (the axle)
+      const spin = new THREE.Group();
+      spin.name = `GT3_SPIN_${SIDE[i]}`;
+      for (const child of [...wheel.children]) spin.add(child);
+      wheel.add(spin);
+      pivotInv.clone().multiply(wheelBind).decompose(wheel.position, wheel.quaternion, wheel.scale);
+      steer.add(wheel);
+      root.add(steer);
+
+      const isLeft = i % 2 === 1;
+      // The authored camber stays on the wheel node: the rig gives the shader the road in that node's frame
+      const tyreMesh = spin.getObjectByName(`${wheelName}_TYRE`) as THREE.Mesh | undefined;
+      const tyre = tyreMesh?.isMesh
+        ? installTyreDeformation(tyreMesh, {
+            unloadedRadiusM: extras.tyreRadius?.[SIDE[i]] ?? 0.34,
+            halfWidthM: extras.tyreHalfWidth?.[SIDE[i]] ?? 0.163,
+            gtSidewall: { brand: "pirelli", compound },
+          })
+        : null;
+      corners.push({ steer, spin, isFront: i < 2, isLeft, restY: steer.position.y, tyre });
+    });
+
+    const body = find("BODY");
+    if (body) bodyGroup.add(body);
+    paintSlots = collectPaintSlots(bodyGroup, (m) => m.name === GT3_PAINT_MATERIAL);
+    if (currentLivery) applyLivery(paintSlots, GT3_PAINT_KEYS, currentLivery);
+
+    if (cockpitTemplate) {
+      const cockpit = cockpitTemplate.clone(true);
+      const cx = (cockpit.getObjectByName("COCKPIT")?.userData ?? {}) as CockpitExtras;
+      body?.traverse((obj) => {
+        if (SOURCE_INTERIOR.some((prefix) => obj.name.startsWith(prefix))) obj.visible = false;
+      });
+      bodyGroup.add(cockpit);
+      steerPivot = cockpit.getObjectByName("STEER") ?? null;
+      if (steerPivot) steerRest.copy(steerPivot.quaternion);
+      steerLockRad = (cx.steerLockDeg ?? 320) * THREE.MathUtils.DEG2RAD;
+      // Shift lights: a material per LED so each lights on its own, at the mod's rpm switch and colour
+      for (const led of cx.leds ?? []) {
+        const mesh = cockpit.getObjectByName(led.name) as THREE.Mesh | undefined;
+        if (!mesh?.isMesh) continue;
+        const material = (mesh.material as THREE.MeshStandardMaterial).clone();
+        const [r, g, b] = led.emissive;
+        material.emissive.setRGB(r, g, b).multiplyScalar(1 / Math.max(r, g, b, 1e-6));
+        material.emissiveIntensity = 0;
+        mesh.material = material;
+        leds.push({ material, rpm: led.rpm });
+      }
+      ledBlinkRpm = cx.ledBlinkRpm ?? Infinity;
+      indicators.abs = cockpit.getObjectByName("DISPLAY_ABS");
+      indicators.tc = cockpit.getObjectByName("DISPLAY_TC");
+      indicators.limiter = cockpit.getObjectByName("LED_RPM_LIMITER");
+      const tcLed = cockpit.getObjectByName("LED_RPM_TC") as THREE.Mesh | undefined;
+      if (tcLed?.isMesh) {
+        const material = (tcLed.material as THREE.MeshStandardMaterial).clone();
+        material.emissive.setRGB(1, 0.75, 0);
+        material.emissiveIntensity = 3;
+        tcLed.material = material;
+        indicators.tcLed = tcLed;
+      }
+      for (const key of ["abs", "tc", "tcLed", "limiter"] as const) {
+        const obj = indicators[key];
+        if (obj) obj.visible = false;
+      }
+      if (indicators.limiter) {
+        const lim = indicators.limiter as THREE.Mesh;
+        const material = (lim.material as THREE.MeshStandardMaterial).clone();
+        material.emissive.setRGB(0.2, 0.4, 1);
+        material.emissiveIntensity = 4;
+        lim.material = material;
+      }
+    }
+    placeholder.removeFromParent();
+    placeholder.geometry.dispose();
+    (placeholder.material as THREE.Material).dispose();
+    chassisGroup.add(bodyGroup);
+
+    cameraAnchors = cameraAnchorsAt(offset);
+  });
+
+  const updateFromTelemetry = (
+    t: CarTelemetry,
+    _pitchRad: number,
+    _rollRad: number,
+    wheelRotationRad: number,
+    _dtSeconds?: number,
+    wheels?: WheelSeating
+  ) => {
+    // telemetry.steering = road-wheel angle / max angle, + = right; rotation.y + = left
+    const roadWheel = -t.steering * maxRoadWheelRad;
+    if (steerPivot) {
+      // The wheel turns about its column (the pivot's local Z, pointing forward up the column): a positive angle
+      // takes the top of the rim to -X, i.e. right
+      steerPivot.quaternion.copy(steerRest);
+      steerPivot.rotateZ(t.steering * steerLockRad);
+    }
+    if (leds.length) {
+      const blinkOff = t.rpm >= ledBlinkRpm && Math.floor(performance.now() / 90) % 2 === 1;
+      for (const led of leds) led.material.emissiveIntensity = t.rpm >= led.rpm && !blinkOff ? 4 : 0;
+    }
+    const aids = t.f12026;
+    if (indicators.abs) indicators.abs.visible = aids?.absActive ?? false;
+    if (indicators.tc) indicators.tc.visible = aids?.tcActive ?? false;
+    if (indicators.tcLed) indicators.tcLed.visible = aids?.tcActive ?? false;
+    if (indicators.limiter) indicators.limiter.visible = t.rpm >= ledBlinkRpm;
+    updateCorners(corners, roadWheel, wheelRotationRad, wheels);
+  };
+
+  return {
+    root,
+    chassisGroup,
+    helmetGroup: new THREE.Group(),
+    setLivery: (livery: LiveryConfig) => {
+      currentLivery = livery;
+      applyLivery(paintSlots, GT3_PAINT_KEYS, livery);
+    },
+    setTireCompound: (c) => {
+      compound = c;
+      for (const corner of corners) corner.tyre?.setCompound(c);
+    },
+    getCameraAnchors: () => cameraAnchors,
+    getLc26Body: () => null,
+    updateFromTelemetry,
+    dispose: () => {
+      disposed = true;
+      for (const c of corners) c.tyre?.dispose();
+      root.removeFromParent();
+    },
+  };
+}

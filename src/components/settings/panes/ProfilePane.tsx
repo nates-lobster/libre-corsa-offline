@@ -1,0 +1,367 @@
+"use client";
+
+import React, { useEffect, useRef, useState } from "react";
+import { useLocale, useTranslations } from "use-intl/react";
+import { Button, ConfirmDialog, SettingRow, TextField, Well } from "@/components/ui";
+import { CHOSEN_TILE, cx, MOTION } from "@/components/ui/styles";
+import { Icon } from "@/components/ui/icons";
+import { focusOnHover } from "@/components/menu/useFocusNav";
+import { CLAIMED_TELEMETRY_PORTS, DEFAULT_TELEMETRY_PORT } from "@/lib/input/device-input";
+import { sanitizeColor, sanitizeDriverCode, sanitizeDriverName } from "@/lib/settings/player-settings";
+import { CARS } from "@/lib/cars/car-registry";
+import { averageFinish, loadDriverStats, mostDriven, type DriverStats } from "@/lib/sim/driver-stats";
+import { TRACKS } from "@/lib/track-registry";
+import { telemetryOut } from "../defs";
+import { useSettingsEnv } from "../env";
+import { SettingsCard } from "../fields";
+import { clearSavedData, resetAllSettings } from "../storage";
+
+// ui-allow: hex-in-style driver colours are data: the colour other players see on the timing tower
+const DRIVER_COLORS = ["#E10600", "#00D2BE", "#FF8700", "#0600EF", "#006F62", "#2B4562", "#B6BABD", "#CCFF00"] as const;
+/** What each swatch above is called (its message), in the same order, for a screen reader (a hex code says nothing) */
+const COLOR_NAMES = ["red", "teal", "orange", "blue", "racingGreen", "navy", "silver", "lime"] as const;
+
+/** The driver's colour: eight swatches and a picker for any other */
+function ColourRow() {
+  const env = useSettingsEnv();
+  const tx = useTranslations("settings.profile.driver");
+  const current = env.settings.profile.color;
+  const set = (c: string) => env.update((s) => ({ ...s, profile: { ...s.profile, color: sanitizeColor(c) } }));
+  return (
+    <SettingRow label={tx("colour")} stacked>
+      <div role="radiogroup" aria-label={tx("colourGroup")} className="flex flex-wrap items-center gap-2">
+        {DRIVER_COLORS.map((c, i) => {
+          const chosen = current.toUpperCase() === c;
+          return (
+            <button
+              key={c}
+              type="button"
+              role="radio"
+              aria-checked={chosen}
+              aria-label={tx(`colours.${COLOR_NAMES[i]}`)}
+              onClick={() => set(c)}
+              onPointerEnter={focusOnHover}
+              className={cx(
+                "inline-flex size-9 cursor-pointer items-center justify-center rounded-full border-[1.5px] pointer-coarse:size-11",
+                MOTION,
+                chosen ? CHOSEN_TILE : "border-transparent",
+                "outline-none focus-visible:outline-none focus:border-lc-volt focus:shadow-lc-focus",
+              )}
+            >
+              {/* ui-allow: hex-in-style the swatch is the driver colour itself (data) */}
+              <span aria-hidden className="size-6 rounded-full inset-ring inset-ring-white/15" style={{ backgroundColor: c }} />
+            </button>
+          );
+        })}
+        <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-full px-3 text-[13px] font-semibold text-lc-fog inset-ring inset-ring-lc-line hover:text-lc-chalk focus-within:inset-ring-lc-volt focus-within:shadow-lc-focus pointer-coarse:h-11">
+          <input
+            type="color"
+            value={current.toLowerCase()}
+            onChange={(e) => set(e.target.value)}
+            className="size-5.5 cursor-pointer rounded-full border-0 bg-transparent p-0 [&::-moz-color-swatch]:rounded-full [&::-moz-color-swatch]:border-0 [&::-webkit-color-swatch]:rounded-full [&::-webkit-color-swatch]:border-0 [&::-webkit-color-swatch-wrapper]:p-0"
+          />
+          {tx("otherColour")}
+        </label>
+      </div>
+    </SettingRow>
+  );
+}
+
+/** One total: the figure over what it counts */
+function StatTile({ value, label, text = false, className }: { value: string; label: string; text?: boolean; className?: string }) {
+  return (
+    <Well className={cx("flex min-w-0 flex-col gap-1 px-3.5 py-2.5 phone:px-3", className)}>
+      <span className={cx("truncate leading-none text-lc-chalk", text ? "text-[14px] font-semibold" : "lc-data text-[20px]")}>{value}</span>
+      <span className="lc-hint truncate">{label}</span>
+    </Well>
+  );
+}
+
+const carTitle = (id: string) => CARS.find((c) => c.id === id)?.title ?? id;
+const circuitName = (id: string) => TRACKS.find((t) => t.id === id)?.name ?? id;
+
+/** The driver's totals across every session (driver-stats.ts): only this player sees them */
+function DriverStatsCard() {
+  const tx = useTranslations("settings.profile.stats");
+  const locale = useLocale();
+  // Read after mount: the page is prerendered without storage
+  const [stats, setStats] = useState<DriverStats | null>(null);
+  useEffect(() => setStats(loadDriverStats()), []);
+  if (!stats) return null;
+  const num = (n: number, digits = 0) =>
+    new Intl.NumberFormat(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n);
+  const minutes = Math.floor(stats.drivingS / 60);
+  const avg = averageFinish(stats);
+  const car = mostDriven(stats.carS);
+  const circuit = mostDriven(stats.trackS);
+  return (
+    <SettingsCard title={tx("title")} description={tx("note")}>
+      <div className="grid grid-cols-4 gap-2.5 phone:grid-cols-2 phone:gap-2">
+        <StatTile
+          value={minutes >= 60 ? tx("hoursMinutes", { hours: num(Math.floor(minutes / 60)), minutes: minutes % 60 }) : tx("minutes", { minutes })}
+          label={tx("timeDriven")}
+        />
+        <StatTile value={tx("km", { km: num(stats.distanceM / 1000, 1) })} label={tx("distance")} />
+        <StatTile value={num(stats.races)} label={tx("races")} />
+        <StatTile value={num(stats.wins)} label={tx("wins")} />
+        <StatTile value={num(stats.podiums)} label={tx("podiums")} />
+        <StatTile value={num(stats.fastestLaps)} label={tx("fastestLaps")} />
+        <StatTile value={avg === null ? "—" : `P${num(avg, 1)}`} label={tx("averageFinish")} />
+        <StatTile value={num(stats.races - stats.finishes)} label={tx("retirements")} />
+        <StatTile value={car ? carTitle(car) : "—"} label={tx("mostDrivenCar")} text className="col-span-2" />
+        <StatTile value={circuit ? circuitName(circuit) : "—"} label={tx("mostDrivenCircuit")} text className="col-span-2" />
+      </div>
+    </SettingsCard>
+  );
+}
+
+/** Settings > Profile and data > Driver: who other players see, and the driver's own totals */
+export function DriverTab() {
+  const env = useSettingsEnv();
+  const tx = useTranslations("settings.profile.driver");
+  const { profile } = env.settings;
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [codeDraft, setCodeDraft] = useState<string | null>(null);
+  /** The name last sent to the board, and whether it is still on its way: one request at a time */
+  const sentName = useRef<string | null>(null);
+  const sending = useRef(false);
+  /** A commit came while a rename was on its way: it runs once that one settles, with the field as it is then */
+  const queued = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  /** `retry`: Enter, which may send a name again after the board said no (it may have been out of reach) */
+  const commitName = (retry = false) => {
+    if (nameDraft === null) return;
+    if (env.onRenameDriver) {
+      // The board has the last word: the field keeps the typed name until it has taken, or says why it did not
+      const typed = nameDraft;
+      // Leaving the field or closing the screen never sends a name already sent; Enter tries it again
+      if (sending.current) {
+        queued.current = true;
+        return;
+      }
+      if (!retry && sentName.current === typed) return;
+      sentName.current = typed;
+      sending.current = true;
+      const settle = () => {
+        sending.current = false;
+        if (!queued.current) return;
+        queued.current = false;
+        commits.current.commitName();
+      };
+      void env.onRenameDriver(typed).then(
+        (error) => {
+          if (alive.current) {
+            setNameError(error);
+            if (error === null) setNameDraft((d) => (d === typed ? null : d));
+          }
+          settle();
+        },
+        () => {
+          // Failed on the way: the next commit may send it again
+          sentName.current = null;
+          settle();
+        },
+      );
+      return;
+    }
+    const name = sanitizeDriverName(nameDraft);
+    if (name !== profile.name) env.update((s) => ({ ...s, profile: { ...s.profile, name, generated: false } }));
+    setNameDraft(null);
+  };
+  const commitCode = () => {
+    if (codeDraft === null) return;
+    env.update((s) => ({ ...s, profile: { ...s.profile, code: sanitizeDriverCode(codeDraft) } }));
+    setCodeDraft(null);
+  };
+  // An edit is saved on Enter, on leaving the field, and when the screen goes away mid-edit
+  const commits = useRef({ commitName, commitCode });
+  commits.current = { commitName, commitCode };
+  useEffect(
+    () => () => {
+      commits.current.commitName();
+      commits.current.commitCode();
+    },
+    [],
+  );
+  const onEnter = (commit: () => void) => (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") commit();
+  };
+
+  return (
+    <>
+    <SettingsCard title={tx("title")} before={
+      <>
+      <div className="grid grid-cols-[minmax(0,1fr)_7rem] gap-3 pb-2">
+        <TextField
+          label={tx("name")}
+          maxLength={16}
+          autoComplete="off"
+          spellCheck={false}
+          value={nameDraft ?? profile.name}
+          onChange={(v) => {
+            sentName.current = null;
+            setNameDraft(v);
+            setNameError(null);
+          }}
+          onKeyDown={onEnter(() => commitName(true))}
+          onBlur={() => commitName()}
+          error={nameError ?? undefined}
+          data-nav-default=""
+        />
+        <TextField
+          label={tx("code")}
+          maxLength={3}
+          autoComplete="off"
+          autoCapitalize="characters"
+          spellCheck={false}
+          value={codeDraft ?? profile.code}
+          onChange={(v) => setCodeDraft(v.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3))}
+          onKeyDown={onEnter(commitCode)}
+          onBlur={commitCode}
+          className="[&_input]:lc-mono [&_input]:text-center [&_input]:tracking-[0.14em]"
+        />
+      </div>
+      <ColourRow />
+      </>
+    }>
+    </SettingsCard>
+    <DriverStatsCard />
+    </>
+  );
+}
+
+/** The telemetry port: typed as text, so a half-typed number never snaps to the range's edge */
+function PortRow() {
+  const env = useSettingsEnv();
+  const tx = useTranslations("settings.profile.data");
+  const w = env.settings.wheel;
+  const [text, setText] = useState(String(w.telemetryPort));
+  const ref = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (document.activeElement !== ref.current) setText(String(w.telemetryPort));
+  }, [w.telemetryPort]);
+  const claimed = CLAIMED_TELEMETRY_PORTS[w.telemetryPort];
+  return (
+    <SettingRow
+      label={tx("udpPort")}
+      advanced
+      hint={
+        claimed
+          ? tx("portConflict", { port: String(w.telemetryPort), app: claimed, defaultPort: String(DEFAULT_TELEMETRY_PORT) })
+          : undefined
+      }
+      disabled={!w.telemetryOut}
+      disabledReason={tx("portOff")}
+      changed={w.telemetryPort !== DEFAULT_TELEMETRY_PORT}
+      onReset={() => env.update((s) => ({ ...s, wheel: { ...s.wheel, telemetryPort: DEFAULT_TELEMETRY_PORT } }))}
+    >
+      <input
+        ref={ref}
+        type="number"
+        inputMode="numeric"
+        min={1024}
+        max={65535}
+        step={1}
+        aria-label={tx("udpPortField")}
+        disabled={!w.telemetryOut}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          const n = Number(e.target.value);
+          if (Number.isInteger(n) && n >= 1024 && n <= 65535) env.update((s) => ({ ...s, wheel: { ...s.wheel, telemetryPort: n } }));
+        }}
+        onBlur={() => setText(String(w.telemetryPort))}
+        className="lc-mono h-10 w-28 rounded-lc-row border border-lc-line bg-lc-well px-3.5 text-end text-[14px] pointer-coarse:text-[16px] text-lc-chalk outline-none focus:border-lc-volt focus:shadow-lc-focus disabled:cursor-not-allowed disabled:opacity-40"
+      />
+    </SettingRow>
+  );
+}
+
+/** Settings > Profile and data > Data: the driver key, telemetry out, and putting everything back */
+export function DataTab() {
+  const env = useSettingsEnv();
+  const tx = useTranslations("settings.profile.data");
+  const [asking, setAsking] = useState<"reset" | "clear" | null>(null);
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  return (
+    <>
+      {env.driverKey ? (
+        <SettingsCard title={tx("driverKey")}>
+          <SettingRow
+            label={tx("identityKey")}
+            hint={env.driverKey.notice ?? tx("identityKeyHint")}
+            navDefault
+          >
+            <Button size="sm" variant="secondary" icon={<Icon name="download" />} onClick={env.driverKey.onExport} data-nav-default="">
+              {tx("save")}
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => fileRef.current?.click()}>
+              {tx("load")}
+            </Button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) env.driverKey?.onImport(f);
+                e.target.value = "";
+              }}
+            />
+          </SettingRow>
+        </SettingsCard>
+      ) : null}
+      <SettingsCard title={tx("telemetry")} rows={[telemetryOut]} first={!env.driverKey}>
+        <PortRow />
+      </SettingsCard>
+      <SettingsCard title={tx("reset")}>
+        <SettingRow label={tx("resetAll")} hint={tx("resetAllHint")}>
+          <Button size="sm" variant="danger" onClick={() => setAsking("reset")}>
+            {tx("resetAllButton")}
+          </Button>
+        </SettingRow>
+        <SettingRow label={tx("clear")} hint={tx("clearHint")}>
+          <Button size="sm" variant="danger" icon={<Icon name="delete" />} onClick={() => setAsking("clear")}>
+            {tx("clearButton")}
+          </Button>
+        </SettingRow>
+      </SettingsCard>
+      <ConfirmDialog
+        open={asking === "reset"}
+        title={tx("resetAllTitle")}
+        confirmLabel={tx("resetAllConfirm")}
+        onCancel={() => setAsking(null)}
+        onConfirm={() => {
+          env.update(resetAllSettings);
+          if (!env.rumble) env.onToggleRumble();
+          setAsking(null);
+        }}
+      >
+        {tx("resetAllBody")}
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={asking === "clear"}
+        title={tx("clearTitle")}
+        confirmLabel={tx("clearConfirm")}
+        busy={busy}
+        onCancel={() => setAsking(null)}
+        onConfirm={() => {
+          setBusy(true);
+          void clearSavedData();
+        }}
+      >
+        {tx("clearBody")}
+      </ConfirmDialog>
+    </>
+  );
+}

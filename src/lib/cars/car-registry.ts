@@ -1,0 +1,677 @@
+import { text as t } from "@/lib/text";
+import type { VehicleModelId } from "@/types/f1";
+import type { CarClassRule } from "@/lib/net/wire";
+import { BMW_M4_GT3_SOUND, F1_2026_SOUND, type CarSoundSource } from "@/lib/sim/CarAudio";
+import { AMG_GT3_SOUND } from "@/lib/sim/gt3/AmgGt3Sim";
+import { SUZUKI_LIANA_SOUND } from "@/lib/sim/road/SuzukiLianaSim";
+import { MTR_496R_SOUND } from "@/lib/sim/proto/Mtr496rSim";
+import { LC_LMDH_SOUND } from "@/lib/sim/proto/LcLmdhSim";
+import { NISSAN_R33_SOUND } from "@/lib/sim/classic/NissanR33Sim";
+import { NISSAN_R32_SOUND } from "@/lib/sim/classic/NissanR32Sim";
+import { BMW_M1_PROCAR_SOUND } from "@/lib/sim/classic/BmwM1ProcarSim";
+import { PORSCHE_934_RSR_SOUND } from "@/lib/sim/classic/Porsche934RsrSim";
+import { VW_SCIROCCO_SOUND } from "@/lib/sim/road/VwSciroccoSim";
+import { CHAPARRAL_2D_67_SOUND, CHAPARRAL_2D_SOUND } from "@/lib/sim/classic/Chaparral2dSim";
+import { NISSAN_R32_SKINS, NISSAN_R33_SKINS } from "./classic-skins";
+import { BMW_M1_PROCAR_SKINS, PORSCHE_934_RSR_SKINS, VW_SCIROCCO_SKINS } from "./pfalzdriver-skins";
+import { CHAPARRAL_2D_67_SKINS, CHAPARRAL_2D_SKINS } from "./chaparral-skins";
+import { AMG_GT3_SKINS, BMW_M4_GT3_SKINS } from "./gt3-skins";
+import { LC_LMDH_SKINS } from "./lmdh-skins";
+import { LIANA_SKINS } from "./liana-skins";
+import type { PortedSkin } from "@/lib/car-builder-2026";
+import { overtakingRulesForSeason, type OvertakingRules } from "@/lib/sim/overtaking-rules";
+import { carListed, REPO_CAR_IDS } from "@/lib/hosted-content";
+
+/**
+ * The cars in the picker, grouped by class and then by year, newest first. A car is a body and a sound on one of the
+ * vehicle models (`VehicleModelId`): setups, telemetry, lap records and leaderboards stay keyed by that model, so a
+ * new car only needs its GLB (`public/cars/<id>/model/`), its sound bank (`public/cars/<id>/audio/`) and an entry
+ * here with its class and year.
+ * The first car of each vehicle model keeps the model's id, so saved choices and `?car=` links still resolve.
+ */
+export type CarId =
+  | "lc26"
+  | "amg-gt3"
+  | "bmw-m4-gt3"
+  | "mtr-496r"
+  | "lc-lmdh"
+  | "liana"
+  | "nissan-r33-jgtc"
+  | "nissan-r32-jtcc"
+  | "bmw-m1-procar"
+  | "vw-scirocco-gtx"
+  | "chaparral-2d"
+  | "chaparral-2d-67"
+  | "porsche-934-rsr";
+
+/**
+ * The kinds of car, one menu category each; a car's year groups it within its class. Class ids live only in code
+ * and the menus' state (saved choices are `CarId`s, an online room's rule is `CarClassRule`), so they can be renamed.
+ */
+export type CarClassId = "f1" | "gt3" | "proto" | "classic" | "road";
+
+export interface CarClass {
+  id: CarClassId;
+  title: string;
+  sub: string;
+  color: string;
+}
+
+/**
+ * Whether a car's physics belong to the car you see, the car-side counterpart of a circuit's `CircuitQuality`:
+ * - "own": its vehicle model was built for this car (the F1 2026 Prototype, the Mercedes-AMG GT3 Evo,
+ *   the MTRacing 496R, the LC-LMDH, the Suzuki Liana, the classic Nissans, the BMW M1 Procar, the VW Scirocco, the
+ *   Chaparral 2Ds)
+ * - "shared": a ported body on another car's model of the same class and era (the BMW)
+ * - "era": a ported body from an earlier season on the 2026 model
+ * The F1 physics switch doesn't change it: a ported F1 car borrows its physics under either model.
+ */
+export type CarQuality = "own" | "shared" | "era";
+
+export interface CarQualityMeta {
+  /** Badge on cards and next to car names */
+  badge: string;
+  /** Filter and group label in the car browser */
+  filterLabel: string;
+  color: string;
+  variant: "solid" | "soft" | "outline";
+  /** Shown in the car detail pane, the browser's footnote and on hover */
+  description: string;
+}
+
+export const CAR_QUALITY_META: Record<CarQuality, CarQualityMeta> = {
+  own: {
+    get badge() { return t("game.carQuality.ownBadge"); },
+    get filterLabel() { return t("game.carQuality.own"); },
+    color: "#00E676",
+    variant: "soft",
+    get description() { return t("game.carQuality.ownDetail"); },
+  },
+  shared: {
+    get badge() { return t("game.carQuality.sharedBadge"); },
+    get filterLabel() { return t("game.carQuality.shared"); },
+    color: "#FFB300",
+    variant: "soft",
+    get description() { return t("game.carQuality.sharedDetail"); },
+  },
+  era: {
+    get badge() { return t("game.carQuality.eraBadge"); },
+    get filterLabel() { return t("game.carQuality.era"); },
+    color: "#FF6B8A",
+    variant: "soft",
+    get description() { return t("game.carQuality.eraDetail"); },
+  },
+};
+
+/**
+ * How far each vehicle model has been checked, shown with a car's grade. Keyed by the model the car drives on now,
+ * so a ported F1 car follows the physics switch.
+ */
+export const PHYSICS_CHECK: Record<VehicleModelId, string> = {
+  "amg-gt3": "Its physics are checked against a real GT3 Evo's telemetry.",
+  lc26: "Its physics are checked against the reference data they were built from.",
+  "f12026-car": "Its physics are checked against the range a 2026 open-wheeler should fall in.",
+  liana: "Its physics come from an Assetto Corsa mod of this car and are checked against its laps of Dunsfold there.",
+  "mtr-496r": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "lc-lmdh": "Its physics follow the LMDh regulations' published limits, with estimates where a car's data is not public.",
+  "nissan-r33-jgtc": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "nissan-r32-jtcc": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "bmw-m1-procar": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "vw-scirocco-gtx": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "chaparral-2d": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "chaparral-2d-67": "Its physics come from the Assetto Corsa mod this car was made for.",
+  "porsche-934-rsr": "Its physics come from the Assetto Corsa mod this car was made for.",
+};
+
+/** Who made a car's 3D body (CREDITS.md has the full notes) */
+export interface CarCredit {
+  /** How the car card introduces the author (absent: "Model by"), for a car credited to its modder instead */
+  label?: string;
+  /** More on where the model comes from, shown with its source */
+  note?: string;
+  title: string;
+  author: string;
+  /** The work's page (the mod) */
+  url: string;
+  /** The author's own page, which their name links to (the car card, the Source panel) */
+  authorUrl?: string;
+  license: string;
+  licenseUrl: string;
+}
+
+/**
+ * One of a ported car's own liveries (its mod's skins): its paint, decals and sunstrip as files beside the model,
+ * `public/cars/<car>/skins/<id>/` (scripts/cars/port_ac_car.py --skins-out), which the rig swaps onto the GLB's
+ * materials by name (the GLB's `skinMaps` extras)
+ */
+export interface CarSkin {
+  id: string;
+  name: string;
+  /** Its two or three main colours, for the picker */
+  swatch: readonly [string, string] | readonly [string, string, string];
+  /**
+   * The livery files it has, when it changes only some of what a livery can (the classic Nissans' skins): the rest stay
+   * as the model was made. Absent: every file the model's `skinMaps` name
+   */
+  files?: readonly string[];
+  /**
+   * The parts it wears when they differ from the first livery's (the Chaparral 2D's Sebring scoop or aero kit): the
+   * model's PART_ nodes the GLB's `partVariants` extras list for this name are shown, the others hidden. Absent: "base"
+   */
+  variant?: string;
+  /** Procedural livery id (`gt3-livery-painter.ts`), projected directly onto the GLB's exterior paint material */
+  procedural?: string;
+  /** Explicitly keeps the GLB's built-in factory paint (even when this skin is not `skins[0]`) */
+  useModelPaint?: boolean;
+}
+
+const CC_BY = { license: "CC BY 4.0", licenseUrl: "https://creativecommons.org/licenses/by/4.0/" } as const;
+const CC_BY_NC_SA = { license: "CC BY-NC-SA 4.0", licenseUrl: "https://creativecommons.org/licenses/by-nc-sa/4.0/" } as const;
+
+/** The F1 2026 Prototype's own body (`public/cars/f12026/model/f12026.glb`), with the AM26's steering wheel */
+const QVIST_F1_2026: CarCredit = {
+  title: "F1 2026 concept (polygon model)",
+  author: "Qvist Designs",
+  url: "https://qvistdesigns.framer.website/",
+  note: "Steering wheel from DeX's AM26 (CC BY 4.0)",
+  ...CC_BY,
+};
+
+/** gregsediting's (Greg_ST's) Assetto Corsa cars, model, physics and sound, used with his permission, credited as he asked (CREDITS.md) */
+const gregSt = (title: string, url: string): CarCredit => ({
+  title,
+  author: "gregsediting",
+  url,
+  authorUrl: "https://www.gtplanet.net/forum/members/greg_st.314907/",
+  license: "Used with the author's permission",
+  licenseUrl: url,
+});
+
+/** Pfalzdriver's Assetto Corsa cars, model, physics and sound, used with his permission (CREDITS.md) */
+const pfalzdriver = (title: string, url: string): CarCredit => ({
+  title,
+  author: "Pfalzdriver",
+  url,
+  authorUrl: "https://www.gtplanet.net/forum/members/pfalzdriver.315633/",
+  license: "Used with the author's permission",
+  licenseUrl: url,
+});
+
+/**
+ * NPanic's Chaparral 2Ds, model, liveries, sound and physics, used with NPanic's permission (CREDITS.md). The mod's page
+ * names everyone whose work is in it; the car card shows them with the source
+ */
+const NPANIC_CHAPARRAL_URL = "https://www.overtake.gg/downloads/1966-1967-chaparral-2d.79525/";
+const npanic = (title: string): CarCredit => ({
+  title,
+  author: "NPanic",
+  url: NPANIC_CHAPARRAL_URL,
+  authorUrl: "https://www.overtake.gg/members/npanic.761347/",
+  note: "3D model by Nugget & NPanic, LoDs by Dodge33, skins by Pasta, physics by Bazza, CSP config by Valentin K, sound by Felix789.",
+  license: "Used with the author's permission",
+  licenseUrl: NPANIC_CHAPARRAL_URL,
+});
+
+/** The 496R's 20 skins, the GLB's own MTR Green first [scripts/cars/port_ac_car.py --skins-out skins.json] */
+const MTR_496R_SKINS: readonly CarSkin[] = [
+  { id: "04_mtrgreen_metallic", name: "#4 MTR Green", swatch: ["#085848", "#081818"] },
+  { id: "01_carbon", name: "#1 Carbon", swatch: ["#181818", "#181818"] },
+  { id: "02_white", name: "#2 White", swatch: ["#e8e8e8", "#b8b8b8"] },
+  { id: "03_blue_metallic", name: "#3 Blue Metallic", swatch: ["#081848", "#081848"] },
+  { id: "05_yellow", name: "#5 Yellow", swatch: ["#e8b808", "#a88808"] },
+  { id: "06_red", name: "#6 Red", swatch: ["#a80808", "#180818"] },
+  { id: "07_mtr_blue", name: "#7 MTR Blue", swatch: ["#080818", "#080818"] },
+  { id: "08_green", name: "#8 Green", swatch: ["#38a808", "#184808"] },
+  { id: "09_violet", name: "#9 Violet", swatch: ["#280878", "#080818"] },
+  { id: "10_dark_purple", name: "#10 Dark Purple", swatch: ["#480818", "#480818"] },
+  { id: "h_2_blue", name: "#2 Blue & Black", swatch: ["#0838b8", "#180818"] },
+  { id: "h_311_red", name: "#311 Red & Black", swatch: ["#e8e8e8", "#e80808"] },
+  { id: "h_35_blue_metallic", name: "#35 Blue Metallic", swatch: ["#180818", "#083868"] },
+  { id: "h_36_blue_metallic", name: "#36 Blue Metallic", swatch: ["#180818", "#083868"] },
+  { id: "h_3_yellow", name: "#3 Yellow & Black", swatch: ["#e8c808", "#180818"] },
+  { id: "h_50_red", name: "#50 Red", swatch: ["#b80808", "#180818"] },
+  { id: "h_51_red", name: "#51 Red", swatch: ["#b80808", "#180818"] },
+  { id: "h_7_black", name: "#7 Matte Black", swatch: ["#787878", "#180818"] },
+  { id: "h_83_yellow", name: "#83 Yellow", swatch: ["#c8a808", "#180818"] },
+  { id: "h_8_black", name: "#8 Matte Black", swatch: ["#787878", "#180818"] },
+];
+
+export interface CarDefinition {
+  id: CarId;
+  classId: CarClassId;
+  title: string;
+  sub: string;
+  /** Short name on chips (not the grade: that's `quality`) */
+  badge: string;
+  /** Whether its physics belong to it */
+  quality: CarQuality;
+  /** Its 3D body's author */
+  credit: CarCredit;
+  /** Who made its tyre textures, when they are someone else's work than the body's (the car card links them) */
+  tyreCredit?: { author: string; url: string };
+  /** Where its 3D body comes from, when the credit names someone else (its modder); absent: the credit */
+  modelSource?: CarCredit;
+  /** The vehicle model that drives it */
+  physics: VehicleModelId;
+  /**
+   * The car's year: the season it raced in, or the model year of a road car. The menus group a class's cars by it,
+   * newest first. For an F1 car it also sets the overtaking aids (`carOvertakingRules`): 2026 on, Straight Mode in
+   * every DRS zone plus Overtake Mode; 2011 to 2025, rear-flap DRS by the 1 s rule; before 2011, no DRS. Other
+   * classes never get them, whatever their year.
+   */
+  year: number;
+  /** A ported GLB on the generic rig (`ported-car-model.ts`); absent: the vehicle model's own car */
+  modelUrl?: string;
+  /**
+   * The plan of its body at barrier height when the body is not its vehicle model's own (`ChassisData.bodyPlan`, as
+   * `scripts/measure-car-plans.ts` prints it): the barriers meet this car's outline, not the other's
+   */
+  bodyPlan?: readonly (readonly [number, number])[];
+  /** The liveries a player can pick for it (the first is the one its GLB is painted in); absent: its factory paint */
+  skins?: readonly CarSkin[];
+  sound: CarSoundSource;
+  /**
+   * A car still being built or not yet driven: left out of every picker and list, and reached only by its
+   * link (`?car=<id>`) in a copy that has its files. Absent: listed
+   */
+  preview?: boolean;
+}
+
+export const CAR_CLASSES: readonly CarClass[] = [
+  { id: "f1", get title() { return t("game.carClass.f1"); }, get sub() { return t("game.carClass.f1Detail"); }, color: "#CCFF00" },
+  { id: "gt3", title: "GT3", get sub() { return t("game.carClass.gt3Detail"); }, color: "#00E5FF" },
+  { id: "proto", get title() { return t("game.carClass.proto"); }, get sub() { return t("game.carClass.protoDetail"); }, color: "#B388FF" },
+  { id: "classic", get title() { return t("game.carClass.classic"); }, get sub() { return t("game.carClass.classicDetail"); }, color: "#FFD23F" },
+  { id: "road", get title() { return t("game.carClass.road"); }, get sub() { return t("game.carClass.roadDetail"); }, color: "#FF8A3D" },
+];
+
+/** GT, prototype and classic racing tyre sidewall packs (gt-tyre-sidewall.ts, CREDITS.md) */
+const SAGATRON_GT_TYRES = { author: "sagatron918", url: "https://www.paypal.me/SagarNaikB" };
+
+/** Every car the game knows, whether or not this copy has its files (`hosted-content.ts`) */
+const ALL_CARS: readonly CarDefinition[] = [
+  {
+    id: "lc26",
+    classId: "f1",
+    title: "2026 Prototype",
+    sub: "2026 model · active aero",
+    badge: "PROTO 26",
+    quality: "own",
+    credit: QVIST_F1_2026,
+    tyreCredit: { author: "Purple Sector", url: "https://www.patreon.com/cw/PurpleSector" },
+    physics: "lc26",
+    year: 2026,
+    sound: F1_2026_SOUND,
+  },
+  {
+    id: "amg-gt3",
+    classId: "gt3",
+    title: "Mercedes-AMG GT3 Evo",
+    sub: "GT3 Evo · 6.2L V8 · Multi-stage ABS / TC",
+    badge: "GT3 EVO",
+    quality: "own",
+    credit: {
+      title: "Mercedes-AMG GT3",
+      author: "Vecarz",
+      url: "https://sketchfab.com/3d-models/mercedes-amg-gt3-wwwvecarzcom-6a3f7e3455064721b74b7f0b66427a07",
+      ...CC_BY_NC_SA,
+      note: "In the Red Bull Racing livery of toddeppe's and VTX's versions of it.",
+    },
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "amg-gt3",
+    // The model's title gives no year: the Evo's homologation year
+    year: 2020,
+    modelUrl: "/cars/amg-gt3-evo/model/amg-gt3-evo.glb",
+    skins: AMG_GT3_SKINS,
+    sound: AMG_GT3_SOUND,
+  },
+
+
+  {
+    id: "bmw-m4-gt3",
+    classId: "gt3",
+    title: "BMW M4 GT3 Evo",
+    sub: "G82 GT3 Evo · AMG GT3 physics · ABS / TC",
+    badge: "M4 GT3",
+    quality: "shared",
+    credit: {
+      title: "2025 BMW M4 GT3 EVO G82",
+      author: "Ddiaz Design",
+      url: "https://sketchfab.com/3d-models/2025-bmw-m4-gt3-evo-g82-113f83dd87064697a5ec2511d280b9d5",
+      ...CC_BY_NC_SA,
+    },
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "amg-gt3",
+    year: 2025,
+    modelUrl: "/cars/bmw-m4-gt3/model/bmw-m4-gt3.glb",
+    skins: BMW_M4_GT3_SKINS,
+    // 28 cm longer than the AMG's, its tail 18 cm further back
+    bodyPlan: [[0.0, 2.32], [0.61, 2.24], [0.94, 2.01], [1.02, 1.84], [1.02, 0.8], [1.02, -1.83], [0.87, -2.27], [0.61, -2.46], [0.48, -2.52], [0.0, -2.52]],
+    sound: BMW_M4_GT3_SOUND,
+  },
+  {
+    id: "mtr-496r",
+    classId: "proto",
+    title: "MTRacing 496R",
+    sub: "2025 · 4.0 L V8 · rear-wheel drive",
+    badge: "496R",
+    quality: "own",
+    // munyuturbo's own Assetto Corsa car, model, physics and sound, used with their permission (CREDITS.md)
+    credit: {
+      title: "MTRacing 496R",
+      author: "munyuturbo",
+      url: "https://www.overtake.gg/members/munyuturbo.1202939/",
+      license: "Used with the author's permission",
+      licenseUrl: "https://www.overtake.gg/members/munyuturbo.1202939/",
+    },
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "mtr-496r",
+    year: 2025,
+    modelUrl: "/cars/mtr-496r/model/mtr-496r.glb",
+    skins: MTR_496R_SKINS,
+    sound: MTR_496R_SOUND,
+  },
+  {
+    id: "lc-lmdh",
+    classId: "proto",
+    title: "LC-LMDH",
+    sub: "LMDh prototype · twin-turbo V8 hybrid · rear-wheel drive",
+    badge: "LC-LMDH",
+    quality: "own",
+    credit: {
+      title: "LMDh prototype (3D model)",
+      author: "kilianhoffmann13",
+      url: "https://sketchfab.com/models/d786aa263a804254aa92543dda11dba0",
+      note: "Cut to the simulator's budget, its marks removed and repainted",
+      ...CC_BY,
+    },
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "lc-lmdh",
+    year: 2026,
+    modelUrl: "/cars/lc-lmdh/model/lc-lmdh.glb",
+    skins: LC_LMDH_SKINS,
+    sound: LC_LMDH_SOUND,
+  },
+  {
+    id: "liana",
+    classId: "road",
+    title: "Suzuki Liana 1.6",
+    sub: "2002 · 1.6 L four · front-wheel drive",
+    badge: "LIANA",
+    quality: "own",
+    // The credit shown is alekabul, for the physics: he gave permission for them and says the model isn't his
+    // (CREDITS.md has where the model comes from)
+    credit: {
+      label: "Physics by",
+      title: "Physics reworked for Top Gear Liana 1.6 GLX",
+      author: "alekabul",
+      url: "https://www.overtake.gg/downloads/physics-reworked-for-top-gear-liana-1-6-glx.28636/",
+      authorUrl: "https://www.overtake.gg/members/alekabul.294399/",
+      note: "The physics are alekabul's, used with his permission. The 3D model isn't his: it comes from a 2015 Assetto Corsa conversion that doesn't name its author.",
+      license: "Used with the author's permission",
+      licenseUrl: "https://www.overtake.gg/downloads/physics-reworked-for-top-gear-liana-1-6-glx.28636/",
+    },
+    physics: "liana",
+    year: 2002,
+    modelUrl: "/cars/liana/model/liana.glb",
+    skins: LIANA_SKINS,
+    sound: SUZUKI_LIANA_SOUND,
+  },
+  {
+    id: "nissan-r33-jgtc",
+    classId: "classic",
+    title: "Nissan Skyline GT-R R33 JGTC",
+    sub: "1998 GT500 · twin-turbo six · rear-wheel drive",
+    badge: "R33 GT500",
+    quality: "own",
+    credit: gregSt("Nissan Skyline BCNR33 JGTC 1998", "https://www.gtplanet.net/forum/downloads/nissan-skyline-bcnr33-jgtc-1998.7199/"),
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "nissan-r33-jgtc",
+    year: 1998,
+    modelUrl: "/cars/nissan-r33-jgtc/model/nissan-r33-jgtc.glb",
+    skins: NISSAN_R33_SKINS,
+    sound: NISSAN_R33_SOUND,
+  },
+  {
+    id: "nissan-r32-jtcc",
+    classId: "classic",
+    title: "Nissan Skyline GT-R R32 JTCC",
+    sub: "1993 Group A · twin-turbo six · four-wheel drive",
+    badge: "R32 GR.A",
+    quality: "own",
+    credit: gregSt("Nissan R32 JTCC (Base 5)", "https://www.gtplanet.net/forum/downloads/nissan-r32-jtcc-base-5.6522/"),
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "nissan-r32-jtcc",
+    year: 1993,
+    modelUrl: "/cars/nissan-r32-jtcc/model/nissan-r32-jtcc.glb",
+    skins: NISSAN_R32_SKINS,
+    sound: NISSAN_R32_SOUND,
+  },
+  {
+    id: "bmw-m1-procar",
+    classId: "classic",
+    title: "BMW M1 Procar",
+    sub: "1979 Procar · 3.5 L straight six · rear-wheel drive",
+    badge: "M1 PROCAR",
+    quality: "own",
+    credit: pfalzdriver("BMW M1 Procar 1979", "https://www.gtplanet.net/forum/downloads/bmw-m1-procar-1979.7616/"),
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "bmw-m1-procar",
+    year: 1979,
+    modelUrl: "/cars/bmw-m1-procar/model/bmw-m1-procar.glb",
+    skins: BMW_M1_PROCAR_SKINS,
+    sound: BMW_M1_PROCAR_SOUND,
+  },
+  {
+    id: "vw-scirocco-gtx",
+    classId: "road",
+    title: "Volkswagen Scirocco GTX 16V",
+    sub: "1985 · 1.8 L 16-valve four · front-wheel drive",
+    badge: "SCIROCCO",
+    quality: "own",
+    credit: pfalzdriver("Volkswagen Scirocco GTX 16V", "https://www.gtplanet.net/forum/downloads/volkswagen-scirocco-gtx-16v.6763/"),
+    physics: "vw-scirocco-gtx",
+    year: 1985,
+    modelUrl: "/cars/vw-scirocco-gtx/model/vw-scirocco-gtx.glb",
+    skins: VW_SCIROCCO_SKINS,
+    sound: VW_SCIROCCO_SOUND,
+  },
+  {
+    id: "chaparral-2d",
+    classId: "classic",
+    title: "Chaparral 2D",
+    sub: "1966 · 5.4 L V8 · two speeds on a torque converter",
+    badge: "2D 1966",
+    quality: "own",
+    credit: npanic("1966-1967 Chaparral 2D"),
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "chaparral-2d",
+    year: 1966,
+    modelUrl: "/cars/chaparral-2d/model/chaparral-2d.glb",
+    skins: CHAPARRAL_2D_SKINS,
+    sound: CHAPARRAL_2D_SOUND,
+  },
+  {
+    id: "chaparral-2d-67",
+    classId: "classic",
+    title: "Chaparral 2D 427",
+    sub: "1967 · 7.0 L V8 · three speeds on a torque converter",
+    badge: "2D 1967",
+    quality: "own",
+    credit: npanic("1966-1967 Chaparral 2D"),
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "chaparral-2d-67",
+    year: 1967,
+    modelUrl: "/cars/chaparral-2d-67/model/chaparral-2d-67.glb",
+    skins: CHAPARRAL_2D_67_SKINS,
+    sound: CHAPARRAL_2D_67_SOUND,
+  },
+  {
+    id: "porsche-934-rsr",
+    classId: "classic",
+    title: "Porsche 934 Turbo RSR",
+    sub: "1976 Group 4 · 3.0 L turbo flat six · rear-wheel drive",
+    badge: "934 RSR",
+    quality: "own",
+    // The car's GTPlanet page is gone; the mod links its author's channel
+    credit: pfalzdriver("Porsche 934 Turbo RSR", "https://www.youtube.com/@Pfalzdriver"),
+    tyreCredit: SAGATRON_GT_TYRES,
+    physics: "porsche-934-rsr",
+    year: 1976,
+    modelUrl: "/cars/porsche-934-rsr/model/porsche-934-rsr.glb",
+    skins: PORSCHE_934_RSR_SKINS,
+    sound: PORSCHE_934_RSR_SOUND,
+  },
+];
+
+/** The cars this copy can drive: all of them on librecorsa.org, the 2026 prototype in a clone of the repository */
+const KNOWN_CARS: readonly CarDefinition[] = ALL_CARS.filter((c) => carListed(c.id));
+
+/** The cars this copy lists: the ones it can drive, less the previews (`CarDefinition.preview`) */
+export const CARS: readonly CarDefinition[] = KNOWN_CARS.filter((c) => !c.preview);
+
+const BY_ID = new Map<string, CarDefinition>(KNOWN_CARS.map((c) => [c.id, c]));
+
+export const isCarId = (value: unknown): value is CarId => typeof value === "string" && BY_ID.has(value);
+
+/** Cars folded into another: a saved choice or a `?car=` link to one opens the car that took its place */
+const FOLDED_CAR_IDS: Readonly<Record<string, CarId>> = {
+  "amg-gt3-evo": "amg-gt3",
+  // The 2026 Prototype's id before it was renamed
+  vf26: "lc26", // keep-old-id
+};
+
+/** A car id from a save or a link, followed to the car that took its place; null when it names no car here */
+export const resolveCarId = (value: unknown): CarId | null => {
+  const id = typeof value === "string" ? (FOLDED_CAR_IDS[value] ?? value) : value;
+  return isCarId(id) ? id : null;
+};
+
+/** Looks up a car across the full registry even when hosted cars are hidden in a local build */
+export const anyCarById = (id: CarId): CarDefinition | undefined => ALL_CARS.find((c) => c.id === id);
+
+export const carById = (id: CarId): CarDefinition => {
+  const car = BY_ID.get(id);
+  if (car) return car;
+  // Typed ids make this a stale save or a removed car; say so rather than quietly driving another one
+  console.warn(`Unknown car "${id}", using ${CARS[0].id}`);
+  return CARS[0];
+};
+
+export const carQualityMeta = (car: Pick<CarDefinition, "quality">): CarQualityMeta => CAR_QUALITY_META[car.quality];
+
+export const carClass = (id: CarClassId): CarClass => CAR_CLASSES.find((c) => c.id === id) ?? CAR_CLASSES[0];
+
+/** A car's class and year, as its chip reads: "F1 · 2018", "Road cars · 2002" */
+export const carClassYear = (car: Pick<CarDefinition, "classId" | "year">): string =>
+  `${carClass(car.classId).title} · ${car.year}`;
+
+/**
+ * The overtaking aids a car races with: an F1 car's by its year (`overtakingRulesForSeason`), none for any other
+ * class (absent: its vehicle model keeps its flaps shut, as a GT3 or road car always has).
+ */
+export const carOvertakingRules = (car: Pick<CarDefinition, "classId" | "year">): OvertakingRules | undefined =>
+  car.classId === "f1" ? overtakingRulesForSeason(car.year) : undefined;
+
+const CLASS_ORDER = new Map<CarClassId, number>(CAR_CLASSES.map((k, i) => [k.id, i]));
+const REGISTRY_ORDER = new Map<CarId, number>(KNOWN_CARS.map((c, i) => [c.id, i]));
+
+/** The menus' order: by class, then newest first, then as listed here */
+export const compareCarsByClassAndYear = (a: CarDefinition, b: CarDefinition): number =>
+  (CLASS_ORDER.get(a.classId) ?? 0) - (CLASS_ORDER.get(b.classId) ?? 0) ||
+  b.year - a.year ||
+  (REGISTRY_ORDER.get(a.id) ?? 0) - (REGISTRY_ORDER.get(b.id) ?? 0);
+
+/**
+ * Whether the livery picker repaints this car. Ported cars (`modelUrl`) keep the paint their GLB was authored
+ * with; the menus show "Factory livery" for them instead of the swatches.
+ */
+export const carTakesLivery = (id: CarId): boolean => !carById(id).modelUrl;
+
+const carThumbDir = (id: CarId): string => {
+  if (REPO_CAR_IDS.has(id)) return "/lc26";
+  // Beside the car's model, so a car that took over another's body shows that body's picture
+  const modelDir = carById(id).modelUrl?.match(/^(\/cars\/[^/]+)\/model\//)?.[1];
+  return modelDir ?? `/cars/${id}`;
+};
+
+/**
+ * The car browser's picture of a car (`npm run car-thumbs` renders them): beside a hosted car's files, so it goes up to
+ * R2 with them (`npm run upload-hosted`), in the folder of the car's model; the repository car drives the 2026
+ * prototype's body, whose pictures are in the repository. A copy without the file shows the card without a picture.
+ */
+export const carThumbUrl = (id: CarId): string => `${carThumbDir(id)}/thumb.webp`;
+
+/** Picture of a car wearing a specific procedural livery (`npm run car-thumbs`), beside its default thumb */
+export const carLiveryThumbUrl = (id: CarId, liveryId: string): string => `${carThumbDir(id)}/thumbs/${liveryId}.webp`;
+
+/** Picture of a ported car wearing a specific mod skin (`npm run car-thumbs`), beside its default thumb */
+export const carSkinThumbUrl = (id: CarId, skinId: string): string => `${carThumbDir(id)}/thumbs/${skinId}.webp`;
+
+/** A car's skin by id, its first (the GLB's own paint) when the id is unknown or absent; null for a car without skins */
+export const carSkin = (id: CarId, skinId: string | null | undefined): CarSkin | null => {
+  const skins = carById(id).skins;
+  if (!skins?.length) return null;
+  return skins.find((s) => s.id === skinId) ?? skins[0];
+};
+
+/** Where a skin's files are: beside the car's model, so they go up to R2 with it */
+export const carSkinBaseUrl = (id: CarId, skinId: string): string => `/cars/${id}/skins/${skinId}`;
+
+/**
+ * Resolves a car's selected `CarSkin` into the `PortedSkin` consumed by `createPortedCarRig`:
+ * - Procedural skins (including procedural defaults such as BMW's `#33 Verstappen Racing`) return `{ baseUrl: "", procedural }`
+ * - Skins marked `useModelPaint` (or traditional mod `skins[0]` without `procedural`) return `null` to keep the GLB's own paint
+ * - File-based mod skins return their hosted folder URL, file list and optional part variant
+ */
+export function portedSkinFor(id: CarId, skin: CarSkin | null | undefined): PortedSkin | null {
+  if (!skin) return null;
+  if (skin.procedural) return { baseUrl: "", procedural: skin.procedural, variant: skin.variant };
+  if (skin.useModelPaint) return null;
+  const skins = anyCarById(id)?.skins;
+  if (!skins?.length || skin.id === skins[0].id) return null;
+  return { baseUrl: carSkinBaseUrl(id, skin.id), files: skin.files, variant: skin.variant };
+}
+
+/** Rich CSS gradient swatch background for a car's skin picker (supports 2-colour mod skins and 3-colour GT3 skins) */
+export function carSkinSwatchBackground(skin: Pick<CarSkin, "swatch">): string {
+  const s = skin.swatch;
+  if (s.length === 3) {
+    return `linear-gradient(130deg, ${s[0]} 0 52%, ${s[2]} 52% 64%, ${s[1]} 64% 100%)`;
+  }
+  return `linear-gradient(135deg, ${s[0]} 0 60%, ${s[1]} 60% 100%)`;
+}
+
+/** Shown in place of the livery swatches for a car that keeps its own paint */
+export const FACTORY_LIVERY_NOTE = "Factory livery: this car keeps its original paint.";
+
+/** The classes that have cars, in picker order */
+export const carClassesInUse = (): CarClass[] => CAR_CLASSES.filter((k) => CARS.some((c) => c.classId === k.id));
+
+/** A class's cars in registry order */
+export const carsInClass = (id: CarClassId): CarDefinition[] => CARS.filter((c) => c.classId === id);
+
+/** The listed cars an online room's class rule lets in, in list order ("any": every listed car) */
+export const carsForClassRule = (rule: CarClassRule): CarDefinition[] => (rule === "any" ? [...CARS] : carsInClass(rule));
+
+/** Their vehicle models, each once (two cars can share one), in list order: what a guest switches to */
+export const listedVehiclesForClassRule = (rule: CarClassRule): VehicleModelId[] => [
+  ...new Set(carsForClassRule(rule).map((c) => c.physics)),
+];
+
+/** A class's cars by year, newest first (registry order within a year), for the year headings in the menus */
+export const carsByYear = (id: CarClassId): { year: number; cars: CarDefinition[] }[] => {
+  const groups = new Map<number, CarDefinition[]>();
+  for (const car of carsInClass(id)) groups.set(car.year, [...(groups.get(car.year) ?? []), car]);
+  return [...groups.entries()].sort(([a], [b]) => b - a).map(([year, cars]) => ({ year, cars }));
+};
+
+/** The car that stands for a vehicle model (its first car), e.g. for a leaderboard entry or a class rule */
+/**
+ * The first car of a vehicle model whether or not this copy lists it: an online board holds laps of cars another copy
+ * lists (a clone without the hosted files sees the GT3's laps too). Undefined for a model with no car of its own.
+ */
+export const anyCarForVehicle = (vehicle: VehicleModelId): CarDefinition | undefined => ALL_CARS.find((c) => c.physics === vehicle);
+
+export const carForVehicle = (vehicle: VehicleModelId): CarDefinition =>
+  KNOWN_CARS.find((c) => c.physics === vehicle) ?? CARS[0];

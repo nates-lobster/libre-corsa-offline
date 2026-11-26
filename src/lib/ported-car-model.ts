@@ -1,0 +1,660 @@
+import * as THREE from "three";
+import { createGltfLoader } from "@/lib/render/gltf-loader";
+import { assetProgress } from "@/lib/loading/asset-progress";
+import { withBasePath } from "@/lib/base-path";
+import type { CarTelemetry, TireCompound } from "@/types/f1";
+import type { PortedSkin, SimCarRig } from "@/lib/car-builder-2026";
+import type { Lc26ModelInstance } from "@/lib/lc26-car-model";
+import { installTyreDeformation, type TyreDeformationHandle } from "@/lib/render/tyre-deformation";
+import type { GtTyreBrand } from "@/lib/render/gt-tyre-sidewall";
+import { cleanPortedCarMaterial, sharpenCarMaps } from "@/lib/render/ported-car-materials";
+import {
+  relativeMatrix,
+  updateCorners,
+  WHEEL_NODES,
+  WHEEL_SIDES,
+  type RigCorner,
+  type WheelSeating,
+} from "@/lib/render/corner-rig";
+import { singlePassTransparency } from "@/lib/render/static-scene";
+import { bodyFloorClearance, type StaticFloor } from "@/lib/render/body-floor";
+import { disableCarCastShadow } from "@/lib/render/car-shadow-proxy";
+import { mergeStaticMeshesByMaterial } from "@/lib/render/merge-static-meshes";
+import { createOpponentLodController, type OpponentLodController } from "@/lib/render/car-lod";
+import {
+  clearAllProceduralLiveryCaches,
+  installPortedProceduralLivery,
+  PROCEDURAL_PROFILE_BY_MATERIAL,
+  type ProceduralBodyProfile,
+  type ProceduralLiveryController,
+  type ProceduralLiverySurface,
+} from "@/lib/render/ported-procedural-livery";
+
+/**
+ * Cars ported to one GLB each (a registry car's `modelUrl`), on any vehicle model. Node layout:
+ *   CAR (extras: wheelCentres, tyreRadius, tyreHalfWidth, cameras, steer)
+ *     BODY      body, driver and fixed interior (sprung)
+ *     STEER     steering wheel pivot, column along its local +Z (optional)
+ *     WHEEL_xx  hub pivot at the tread centre in the car's axes; children WHEEL_xx_RIM / WHEEL_xx_TYRE
+ * Model space: +X left, +Y up, +Z forward, floor at y = 0 (the rig's axes). `chassis` puts the model's axle midpoint
+ * on the vehicle model's.
+ */
+export interface PortedCarOptions {
+  url: string;
+  chassis: { wheelbase: number; frontWeightFraction: number; maxRoadWheelDeg: number };
+  /** Steering wheel rotation each way at full lock (deg) */
+  steerLockDeg: number;
+  /**
+   * The vehicle model's floor at rest (`staticFloorOf`): the body (and the cameras and steering wheel on it) moves
+   * on its wheels until its floor is there, since exports model it at any height (some in a showroom pose well above
+   * the wheels, which floated over the road). The wheels stay on the road.
+   */
+  floor: StaticFloor;
+  /**
+   * Rig-space cameras to use instead of the GLB's own (e.g. the AMG GT3's for every car on the GT3 model), built from
+   * where this model's steering wheel and front axle landed in rig space
+   */
+  cameraAnchors?: (fit: PortedCameraFit) => Lc26ModelInstance["cameraAnchors"];
+  /** A 2018+ car: its tyres get the 2026 Pirelli sidewall, recoloured by the compound (the model's own otherwise) */
+  pirelliSidewall?: boolean;
+  /** Non-F1 racing car GT tyre sidewall brand (sagatron918 packs, `gt-tyre-sidewall.ts`) */
+  gtSidewall?: GtTyreBrand | null;
+  /**
+   * A livery of the car's own to wear instead of the paint its GLB was made in: its files (`carSkinBaseUrl`) replace
+   * the textures of the materials the GLB's `skinMaps` extras name
+   */
+  skin?: PortedSkin | null;
+  /** Opponent car: casts shadows through a 1-draw proxy on SHADOW_PROXY_LAYER instead of its full mesh hierarchy */
+  opponent?: boolean;
+}
+
+/** A ported model's driver and nose in rig space, once loaded */
+export interface PortedCameraFit {
+  /** Centre of the steering wheel's meshes (null: no `STEER` node) */
+  steerCentre: THREE.Vector3 | null;
+  /** Front axle line (z) */
+  frontAxleZ: number;
+}
+
+interface PortedExtras {
+  wheelCentres?: Record<string, [number, number, number]>;
+  tyreRadius?: Record<string, number>;
+  tyreHalfWidth?: Record<string, number>;
+  cameras?: Partial<Record<string, { pos: [number, number, number]; pitchDeg: number; fov: number }>>;
+  /** The wheel's shift lights (ported-wheel-dash.ts), handed on to the `STEER` node */
+  revLeds?: unknown;
+  /** GLB material name -> the file of a livery that replaces its colour texture */
+  skinMaps?: Record<string, string>;
+  /** PART_ node -> the livery variants that show it (`CarSkin.variant`, "base" for a livery that names none) */
+  partVariants?: Record<string, string[]>;
+}
+
+/** Livery textures, loaded once each and shared by every car wearing them */
+const skinTextures = new Map<string, Promise<THREE.Texture | null>>();
+
+function loadSkinTexture(url: string, like: THREE.Texture | null): Promise<THREE.Texture | null> {
+  let tex = skinTextures.get(url);
+  if (!tex) {
+    tex = new THREE.TextureLoader()
+      .loadAsync(withBasePath(url))
+      .then(async (t) => {
+        const img = t.image as HTMLImageElement | undefined;
+        if (img && typeof img.decode === "function") await img.decode().catch(() => {});
+        // As the GLB's own: glTF UVs (no flip), sRGB colour, repeating
+        t.flipY = false;
+        t.colorSpace = THREE.SRGBColorSpace;
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.anisotropy = like?.anisotropy ?? 4;
+        t.needsUpdate = true;
+        return t;
+      })
+      .catch((err) => {
+        console.warn(`Livery texture ${url} not loaded, keeping the model's paint`, err);
+        return null;
+      });
+    skinTextures.set(url, tex);
+  }
+  return tex;
+}
+
+/** Disposes and clears cached skin textures (used by offline batch thumbnail rendering to cap VRAM across dozens of skins) */
+export async function clearSkinTextureCache(): Promise<void> {
+  clearAllProceduralLiveryCaches();
+  const entries = [...skinTextures.values()];
+  skinTextures.clear();
+  for (const p of entries) {
+    const tex = await p;
+    tex?.dispose();
+  }
+}
+
+const WHEELS = WHEEL_NODES;
+const SIDE = WHEEL_SIDES;
+const CAMERA_KEYS = ["cockpit", "tcam", "dash", "bumper", "nearChase", "farChase"] as const;
+
+const templates = new Map<string, Promise<THREE.Group | null>>();
+
+/**
+ * The `CAR` root a ported GLB's extras sit on. Found by its `wheelCentres`, not its name: three's GLTFLoader names the
+ * scene before its nodes, so in a GLB whose scene is also called "CAR" (the GT3 ports') the root node loads as
+ * "CAR_1" and `getObjectByName("CAR")` returns the scene, which has no extras.
+ */
+export function portedCarRoot(model: THREE.Object3D): THREE.Object3D {
+  let root: THREE.Object3D | undefined;
+  model.traverse((o) => {
+    if (!root && (o.userData as Partial<PortedExtras> | undefined)?.wheelCentres) root = o;
+  });
+  return root ?? model.getObjectByName("CAR") ?? model;
+}
+
+/** Named body nodes/materials kept unmerged so headlight, taillight, mirror and dash hooks can find them cleanly */
+const PRESERVED_BODY_NODE_RE = /head|light|lamp|tail|brake|stop|rear_?led|mirror|dash|display|screen|glass|lens|beam|bulb|drl|fog/i;
+
+/** Loads (once) and caches a ported car GLB; the rigs clone it. Exported to pre-warm opponents before a race */
+export function loadTemplate(url: string): Promise<THREE.Group | null> {
+  let template = templates.get(url);
+  if (!template) {
+    template = (async () => {
+      if (typeof window === "undefined") return null;
+      const full = withBasePath(url);
+      assetProgress.begin("car");
+      try {
+        const scene = (await createGltfLoader().loadAsync(full, (event) => assetProgress.progress("car", event))).scene;
+        scene.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          mesh.material = Array.isArray(mesh.material)
+            ? mesh.material.map(cleanPortedCarMaterial)
+            : cleanPortedCarMaterial(mesh.material);
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          for (const m of mats) {
+            const std = m as THREE.MeshStandardMaterial;
+            sharpenCarMaps(m);
+            if (std.transparent) std.depthWrite = false;
+            singlePassTransparency(std);
+          }
+        });
+        alignWheelAxles(scene);
+        // Merge static same-material meshes under BODY once on the template (e.g. bmw-m4-gt3 217 -> ~18 body draws)
+        const car = portedCarRoot(scene);
+        const extras = (car.userData ?? {}) as PortedExtras;
+        const body = scene.getObjectByName("BODY");
+        if (body) {
+          const variantNodes = new Set(Object.keys(extras.partVariants ?? {}));
+          mergeStaticMeshesByMaterial(body, {
+            namePrefix: "PORTED_BODY_Merged",
+            disposeSources: true,
+            skip: (obj) => {
+              if (obj.name === "STEER" || variantNodes.has(obj.name) || obj.name.startsWith("PART_")) return true;
+              if (PRESERVED_BODY_NODE_RE.test(obj.name)) return true;
+              const m = (obj as THREE.Mesh).isMesh && !Array.isArray((obj as THREE.Mesh).material) ? ((obj as THREE.Mesh).material as THREE.Material) : null;
+              if (m && PRESERVED_BODY_NODE_RE.test(m.name)) return true;
+              return false;
+            },
+          });
+        }
+        scene.updateMatrixWorld(true);
+        assetProgress.done("car");
+        return scene;
+      } catch (err) {
+        console.warn(`Car model ${url} not loaded, using the placeholder body`, err);
+        assetProgress.fail("car");
+        return null;
+      }
+    })();
+    templates.set(url, template);
+  }
+  return template;
+}
+
+/**
+ * Re-bases each wheel so it spins about its own axle. Some exports bake 2-3 degrees of toe or camber into the wheel
+ * geometry (SF-26 and W17 fronts, all four BMW M4 GT3 wheels), so spinning about the wheel node's X axis wobbled.
+ * The axle is the tyre's least-spread direction; the geometry is turned to put it on X and the node takes the
+ * inverse turn, so the wheel looks the same at rest and spins true. Done once on the template.
+ */
+function alignWheelAxles(scene: THREE.Object3D): void {
+  for (const name of WHEELS) {
+    const wheel = scene.getObjectByName(name);
+    if (!wheel) continue;
+    wheel.updateMatrixWorld(true);
+    const toWheel = wheel.matrixWorld.clone().invert();
+    const meshes: THREE.Mesh[] = [];
+    wheel.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh && obj !== wheel) meshes.push(obj as THREE.Mesh);
+    });
+    const tyre = meshes.find((m) => m.name.endsWith("_TYRE"));
+    if (!tyre) continue;
+    // Tyre vertices in the wheel's frame
+    const local = toWheel.clone().multiply(tyre.matrixWorld);
+    const pos = tyre.geometry.getAttribute("position");
+    const v = new THREE.Vector3();
+    const mean = new THREE.Vector3();
+    const pts: THREE.Vector3[] = [];
+    const step = Math.max(1, Math.floor(pos.count / 4000));
+    for (let i = 0; i < pos.count; i += step) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(local);
+      pts.push(v.clone());
+      mean.add(v);
+    }
+    mean.multiplyScalar(1 / pts.length);
+    // Covariance and its smallest eigenvector (power iteration on the shifted matrix)
+    const c = [0, 0, 0, 0, 0, 0]; // xx xy xz yy yz zz
+    for (const p of pts) {
+      const x = p.x - mean.x, y = p.y - mean.y, z = p.z - mean.z;
+      c[0] += x * x; c[1] += x * y; c[2] += x * z; c[3] += y * y; c[4] += y * z; c[5] += z * z;
+    }
+    const tr = c[0] + c[3] + c[5];
+    const m = new THREE.Matrix3().set(tr - c[0], -c[1], -c[2], -c[1], tr - c[3], -c[4], -c[2], -c[4], tr - c[5]);
+    const axle = new THREE.Vector3(1, 0, 0);
+    for (let k = 0; k < 64; k++) axle.applyMatrix3(m).normalize();
+    if (axle.x < 0) axle.negate();
+    const tiltDeg = THREE.MathUtils.radToDeg(axle.angleTo(new THREE.Vector3(1, 0, 0)));
+    if (tiltDeg < 0.25) continue;
+    const align = new THREE.Quaternion().setFromUnitVectors(axle, new THREE.Vector3(1, 0, 0));
+    const R = new THREE.Matrix4().makeRotationFromQuaternion(align);
+    for (const mesh of meshes) {
+      // bake the mesh's own transform relative to the wheel, then turn it onto the axle
+      const meshLocal = toWheel.clone().multiply(mesh.matrixWorld);
+      mesh.geometry = mesh.geometry.clone();
+      mesh.geometry.applyMatrix4(R.clone().multiply(meshLocal));
+      mesh.removeFromParent();
+      wheel.add(mesh);
+      mesh.position.set(0, 0, 0);
+      mesh.quaternion.identity();
+      mesh.scale.set(1, 1, 1);
+    }
+    wheel.quaternion.multiply(align.clone().invert());
+    wheel.updateMatrixWorld(true);
+  }
+}
+
+
+/** A box the size of a car, shown while (or instead of, when the GLB is missing) the model loads */
+function placeholderBody(): THREE.Mesh {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1.9, 0.8, 4.8),
+    new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.6, roughness: 0.4 })
+  );
+  mesh.position.y = 0.55;
+  mesh.castShadow = true;
+  return mesh;
+}
+
+/** Body drop per model and vehicle-model floor, measured once (it reads every level face of the body) */
+const bodyDrops = new Map<string, number>();
+
+/**
+ * How far (m) to lower a model's body for its floor to sit on the vehicle model's at rest (`bodyFloorClearance`;
+ * negative raises it); 0 for a model with no `BODY` node or too little level area between its axles to measure
+ */
+function bodyDropOf(
+  model: THREE.Object3D,
+  car: THREE.Object3D,
+  offset: THREE.Vector3,
+  frontAxleZ: number,
+  rearAxleZ: number,
+  options: PortedCarOptions
+): number {
+  const f = options.floor;
+  const key = `${options.url}|${offset.y}|${offset.z}|${f.frontAxleZ}|${f.rearAxleZ}|${f.frontY}|${f.rearY}`;
+  let drop = bodyDrops.get(key);
+  if (drop === undefined) {
+    const body = model.getObjectByName("BODY");
+    const toCar = new THREE.Matrix4().makeTranslation(offset.x, offset.y, offset.z).multiply(car.matrixWorld.clone().invert());
+    const clearance = body ? bodyFloorClearance(body, toCar, frontAxleZ + offset.z, rearAxleZ + offset.z, f) : null;
+    if (clearance === null) console.warn(`Ported car model ${options.url}: no floor found under BODY, body left as modelled`);
+    drop = clearance ?? 0;
+    bodyDrops.set(key, drop);
+  }
+  return drop;
+}
+
+export interface SkinSlot {
+  mat: THREE.MeshStandardMaterial;
+  file: string;
+  own: THREE.Texture | null;
+  /** False when the material is already a per-rig clone owned (and disposed) by `installTyreDeformation`. */
+  ownedBySkin: boolean;
+}
+
+/**
+ * Clones materials named in `skinMaps` so each rig can swap liveries without mutating the shared GLB template.
+ * Materials in `preserveMaterials` (per-wheel tyre deformation materials carrying `onBeforeCompile` and
+ * `customProgramCacheKey` hooks) are already private per-rig clones and are bound directly as skin slots without
+ * cloning — Three.js `Material.clone()` does not copy shader hooks.
+ */
+export function collectSkinSlots(
+  roots: readonly THREE.Object3D[],
+  skinMaps: Readonly<Record<string, string>>,
+  preserveMaterials?: ReadonlySet<THREE.Material>
+): SkinSlot[] {
+  const slots: SkinSlot[] = [];
+  const copies = new Map<THREE.Material, THREE.MeshStandardMaterial>();
+  const seenPreserved = new Set<THREE.Material>();
+  const visit = (o: THREE.Object3D) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh || Array.isArray(mesh.material)) return;
+    const src = mesh.material as THREE.MeshStandardMaterial;
+    const file = skinMaps[src.name];
+    if (!file || !src.isMeshStandardMaterial) return;
+    if (preserveMaterials?.has(src)) {
+      if (!seenPreserved.has(src)) {
+        seenPreserved.add(src);
+        slots.push({ mat: src, file, own: src.map, ownedBySkin: false });
+      }
+      return;
+    }
+    let copy = copies.get(src);
+    if (!copy) {
+      copy = src.clone();
+      copies.set(src, copy);
+      slots.push({ mat: copy, file, own: src.map, ownedBySkin: true });
+    }
+    mesh.material = copy;
+  };
+  for (const r of roots) r.traverse(visit);
+  return slots;
+}
+
+/**
+ * A ported car's rig: model body (and steering wheel) in `chassisGroup` (sprung), wheels on per-corner steer pivots
+ * under `root` (unsprung), aligned so the model's axles sit on the physics axles.
+ */
+export function createPortedCarRig(options: PortedCarOptions): SimCarRig {
+  const root = new THREE.Group();
+  root.name = "PORTED_CAR_RIG";
+  const chassisGroup = new THREE.Group();
+  root.add(chassisGroup);
+  const placeholder = placeholderBody();
+  if (options.opponent) placeholder.castShadow = false;
+  chassisGroup.add(placeholder);
+
+  const { chassis } = options;
+  const maxRoadWheelRad = chassis.maxRoadWheelDeg * THREE.MathUtils.DEG2RAD;
+  const steerLockRad = options.steerLockDeg * THREE.MathUtils.DEG2RAD;
+  let cameraAnchors: Lc26ModelInstance["cameraAnchors"] | null = null;
+
+  const corners: RigCorner[] = [];
+  let steerPivot: THREE.Object3D | null = null;
+  const steerRest = new THREE.Quaternion();
+  let opponentLod: OpponentLodController | null = null;
+  let lastLod: 0 | 1 = 0;
+  let disposed = false;
+  // The compound the sidewalls show; the tyres are built when the model loads
+  let compound: TireCompound = "medium";
+  // The livery: this rig's copies of the materials it repaints (with their own textures), and the skin it wears
+  const skinSlots: SkinSlot[] = [];
+  let proceduralLivery: ProceduralLiveryController | null = null;
+  let skin = options.skin ?? null;
+  // A livery's own parts (the GLB's `partVariants`): each shown only for the liveries of its variants
+  const parts: { node: THREE.Object3D; variants: readonly string[] }[] = [];
+  const applySkin = (): Promise<void> => {
+    const wearing = skin;
+    const variant = wearing?.variant ?? "base";
+    for (const part of parts) part.node.visible = part.variants.includes(variant);
+    proceduralLivery?.set(wearing?.procedural ?? null);
+    const pending: Promise<void>[] = [];
+    for (const slot of skinSlots) {
+      // No livery, procedural GT3 livery, or one that leaves this file as the model has it
+      if (!wearing || wearing.procedural || (wearing.files && !wearing.files.includes(slot.file))) {
+        slot.mat.map = slot.own;
+        slot.mat.needsUpdate = true;
+        continue;
+      }
+      pending.push(
+        loadSkinTexture(`${wearing.baseUrl}/${slot.file}`, slot.own).then((tex) => {
+          if (disposed || skin !== wearing || !tex) return;
+          slot.mat.map = tex;
+          slot.mat.needsUpdate = true;
+        })
+      );
+    }
+    return Promise.all(pending).then(() => undefined);
+  };
+
+  void loadTemplate(options.url).then((template) => {
+    if (!template || disposed) return;
+    const model = template.clone(true);
+    model.updateMatrixWorld(true);
+    const car = portedCarRoot(model);
+    const extras = (car.userData ?? {}) as PortedExtras;
+    const find = (name: string) => model.getObjectByName(name);
+
+    // Axle midpoint on the physics' (rig origin = CG on the ground), tyres on the ground
+    if (!extras.wheelCentres?.WHEEL_LF || !extras.wheelCentres?.WHEEL_LR) {
+      console.warn("Ported car model has no wheelCentres: axles placed at nominal positions");
+    }
+    const lf = extras.wheelCentres?.WHEEL_LF ?? [0.8, 0.35, 1.5];
+    const lr = extras.wheelCentres?.WHEEL_LR ?? [0.8, 0.35, -1.5];
+    const physicsMidZ = chassis.wheelbase * (0.5 - chassis.frontWeightFraction);
+    const offset = new THREE.Vector3(0, (extras.tyreRadius?.LF ?? lf[1]) - lf[1], physicsMidZ - 0.5 * (lf[2] + lr[2]));
+
+    // The body, and everything placed on it, moves on its wheels to put its floor on the physics'; the wheels keep
+    // `offset`
+    const bodyOffset = offset.clone();
+    bodyOffset.y -= bodyDropOf(model, car, offset, lf[2], lr[2], options);
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = "PORTED_BODY";
+    bodyGroup.position.copy(bodyOffset);
+
+    // The steering wheel's centre in rig space, read before the nodes move (the model is at its bind pose here)
+    const steerSource = find("STEER");
+    const steerBox = steerSource ? new THREE.Box3().setFromObject(steerSource, true) : null;
+    const steerCentre =
+      steerBox && !steerBox.isEmpty()
+        ? steerBox.getCenter(new THREE.Vector3()).applyMatrix4(car.matrixWorld.clone().invert()).add(bodyOffset)
+        : null;
+    const cameraFit: PortedCameraFit = { steerCentre, frontAxleZ: lf[2] + offset.z };
+
+    const tyreMaterials = new Set<THREE.Material>();
+    WHEELS.forEach((wheelName, i) => {
+      const wheel = find(wheelName);
+      if (!wheel) return;
+      const wheelBind = relativeMatrix(wheel, car);
+      const centre = new THREE.Vector3().setFromMatrixPosition(wheelBind);
+      const steer = new THREE.Group();
+      steer.name = `PORTED_STEER_${SIDE[i]}`;
+      steer.position.copy(centre).add(offset);
+      // Rim and tyre spin about the wheel node's X (the axle)
+      const spin = new THREE.Group();
+      spin.name = `PORTED_SPIN_${SIDE[i]}`;
+      for (const child of [...wheel.children]) spin.add(child);
+      wheel.add(spin);
+      new THREE.Matrix4()
+        .makeTranslation(-centre.x, -centre.y, -centre.z)
+        .multiply(wheelBind)
+        .decompose(wheel.position, wheel.quaternion, wheel.scale);
+      steer.add(wheel);
+      root.add(steer);
+
+      const tyreMesh = spin.getObjectByName(`${wheelName}_TYRE`) as THREE.Mesh | undefined;
+      const tyre = tyreMesh?.isMesh
+        ? installTyreDeformation(tyreMesh, {
+            unloadedRadiusM: extras.tyreRadius?.[SIDE[i]] ?? 0.34,
+            halfWidthM: extras.tyreHalfWidth?.[SIDE[i]] ?? 0.16,
+            pirelliSidewall: options.pirelliSidewall ? compound : undefined,
+            gtSidewall: !options.pirelliSidewall && options.gtSidewall ? { brand: options.gtSidewall, compound } : undefined,
+            subdivide: !options.opponent,
+          })
+        : null;
+      if (tyre && tyreMesh?.isMesh && !Array.isArray(tyreMesh.material)) {
+        tyreMaterials.add(tyreMesh.material);
+      }
+      corners.push({ steer, spin, isFront: i < 2, isLeft: i % 2 === 1, restY: steer.position.y, tyre });
+    });
+
+    const body = find("BODY");
+    if (body) bodyGroup.add(body);
+    const steerNode = find("STEER");
+    if (steerNode) {
+      bodyGroup.add(steerNode);
+      if (options.opponent) {
+        // Interior steering wheel is not readable on opponent cars; hiding it saves 1-63 draws per car
+        steerNode.visible = false;
+      } else {
+        steerPivot = steerNode;
+        steerRest.copy(steerNode.quaternion);
+        if (extras.revLeds) steerNode.userData.revLeds = extras.revLeds;
+      }
+    }
+    for (const [name, variants] of Object.entries(extras.partVariants ?? {})) {
+      const node = bodyGroup.getObjectByName(name) ?? find(name);
+      if (node) parts.push({ node, variants });
+    }
+    // The materials a livery repaints, copied for this car (the template's are every car's): the body's and the
+    // wheels' (a livery can recolour the rims). Tyre deformation materials are already private clones with shader
+    // hooks, so keep them in place instead of cloning over them.
+    const skinMaps = extras.skinMaps;
+    if (skinMaps) {
+      skinSlots.push(...collectSkinSlots([bodyGroup, ...corners.map((c) => c.spin)], skinMaps, tyreMaterials));
+    }
+    // Procedural bodywork livery controller (AMG GT3 Evo, BMW M4 GT3 Evo, LC-LMDH, Suzuki Liana)
+    if (body) {
+      bodyGroup.updateMatrixWorld(true);
+      let procProfile: ProceduralBodyProfile | null = null;
+      const procSurfaces: ProceduralLiverySurface[] = [];
+      const slotByMat = new Map<THREE.Material, SkinSlot>(skinSlots.map((s) => [s.mat, s]));
+      const replacedSlots = new Set<SkinSlot>();
+      const cloneForProcedural = (src: THREE.MeshStandardMaterial, frameMatrix: THREE.Matrix4): THREE.MeshStandardMaterial => {
+        const copy = src.clone();
+        procSurfaces.push({ material: copy, frameMatrix });
+        const slot = slotByMat.get(src);
+        if (slot) {
+          skinSlots.push({ mat: copy, file: slot.file, own: slot.own, ownedBySkin: false });
+          replacedSlots.add(slot);
+        }
+        return copy;
+      };
+      bodyGroup.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const frameMatrix = relativeMatrix(mesh, body);
+        if (Array.isArray(mesh.material)) {
+          let changed = false;
+          const next = mesh.material.map((m) => {
+            const src = m as THREE.MeshStandardMaterial;
+            const prof = src.isMeshStandardMaterial ? PROCEDURAL_PROFILE_BY_MATERIAL[src.name] : undefined;
+            if (!prof) return m;
+            procProfile = prof;
+            changed = true;
+            return cloneForProcedural(src, frameMatrix);
+          });
+          if (changed) mesh.material = next;
+          return;
+        }
+        const src = mesh.material as THREE.MeshStandardMaterial;
+        const prof = src.isMeshStandardMaterial ? PROCEDURAL_PROFILE_BY_MATERIAL[src.name] : undefined;
+        if (!prof) return;
+        procProfile = prof;
+        mesh.material = cloneForProcedural(src, frameMatrix);
+      });
+      if (replacedSlots.size > 0) {
+        const stillUsed = new Set<THREE.Material>();
+        for (const scope of [bodyGroup, ...corners.map((c) => c.spin)]) {
+          scope.traverse((o) => {
+            const m = (o as THREE.Mesh).material;
+            if (!m) return;
+            if (Array.isArray(m)) for (const entry of m) stillUsed.add(entry);
+            else stillUsed.add(m);
+          });
+        }
+        for (let i = skinSlots.length - 1; i >= 0; i--) {
+          const slot = skinSlots[i];
+          if (replacedSlots.has(slot) && !stillUsed.has(slot.mat)) {
+            if (slot.ownedBySkin) slot.mat.dispose();
+            skinSlots.splice(i, 1);
+          }
+        }
+      }
+      if (procProfile && procSurfaces.length > 0) {
+        proceduralLivery = installPortedProceduralLivery(procSurfaces, procProfile);
+      }
+    }
+    applySkin();
+    if (options.opponent) {
+      disableCarCastShadow(bodyGroup);
+      for (const c of corners) disableCarCastShadow(c.steer);
+      opponentLod = createOpponentLodController([bodyGroup, ...corners.map((c) => c.spin)]);
+      opponentLod.setLod(lastLod);
+    }
+    placeholder.removeFromParent();
+    placeholder.geometry.dispose();
+    (placeholder.material as THREE.Material).dispose();
+    chassisGroup.add(bodyGroup);
+
+    const cams = extras.cameras ?? {};
+    const anchors = {} as Lc26ModelInstance["cameraAnchors"];
+    for (const key of CAMERA_KEYS) {
+      const c = cams[key] ?? { pos: [0, 0.9, 0] as [number, number, number], pitchDeg: -5, fov: 58 };
+      anchors[key] = {
+        pos: new THREE.Vector3(...c.pos).add(bodyOffset),
+        pitchRad: c.pitchDeg * THREE.MathUtils.DEG2RAD,
+        fovDeg: c.fov,
+      };
+    }
+    // Behind and above the eye point, for the sim's shoulder view
+    anchors.shoulder = {
+      pos: anchors.cockpit.pos.clone().add(new THREE.Vector3(0, 0.18, -0.3)),
+      pitchRad: -8 * THREE.MathUtils.DEG2RAD,
+      fovDeg: anchors.cockpit.fovDeg + 3,
+    };
+    cameraAnchors = options.cameraAnchors?.(cameraFit) ?? anchors;
+  });
+
+  const updateFromTelemetry = (
+    t: CarTelemetry,
+    _pitchRad: number,
+    _rollRad: number,
+    wheelRotationRad: number,
+    _dtSeconds?: number,
+    wheels?: WheelSeating
+  ) => {
+    // telemetry.steering = road-wheel angle / max angle, + = right; rotation.y + = left
+    const roadWheel = -t.steering * maxRoadWheelRad;
+    if (steerPivot) {
+      // About the column (local +Z): a positive angle takes the top of the rim to -X, i.e. right
+      steerPivot.quaternion.copy(steerRest);
+      steerPivot.rotateZ(t.steering * steerLockRad);
+    }
+    updateCorners(corners, roadWheel, wheelRotationRad, wheels);
+    if (options.opponent) {
+      const lod: 0 | 1 = wheels?.lod ?? 0;
+      lastLod = lod;
+      opponentLod?.setLod(lod);
+    }
+  };
+
+  return {
+    root,
+    chassisGroup,
+    helmetGroup: new THREE.Group(),
+    // The model keeps its own paint (or wears a livery of its own, `setSkin`); a 2026 car's tyre sidewalls show the
+    // compound
+    setLivery: () => {},
+    setSkin: (next) => {
+      if (next?.baseUrl === skin?.baseUrl && next?.variant === skin?.variant && next?.procedural === skin?.procedural) {
+        return Promise.resolve();
+      }
+      skin = next;
+      return applySkin();
+    },
+    setTireCompound: (c) => {
+      compound = c;
+      for (const corner of corners) corner.tyre?.setCompound(c);
+    },
+    getCameraAnchors: () => cameraAnchors,
+    getLc26Body: () => null,
+    updateFromTelemetry,
+    dispose: () => {
+      disposed = true;
+      opponentLod?.dispose();
+      proceduralLivery?.dispose();
+      for (const c of corners) c.tyre?.dispose();
+      for (const slot of skinSlots) if (slot.ownedBySkin) slot.mat.dispose();
+      root.removeFromParent();
+    },
+  };
+}

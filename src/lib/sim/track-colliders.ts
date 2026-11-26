@@ -1,0 +1,74 @@
+import * as THREE from 'three';
+import { getActiveSurfaceTable, getActiveTrackData, getActiveTrackMetadata } from '@/lib/track-data';
+import { TrackColliderQuery, TrackWallQuery, type RoadFacing, type TrackColliderBuffers, type TrackWallBuffers } from './f12026-car/TrackColliderQuery';
+import { applyDrawnSurfaceRules } from './drawn-surfaces';
+
+export interface TrackColliders {
+  /** Null when the GLB has no `Track_Collider_Road`: the cars stay on the track samples' ground */
+  ground: TrackColliderQuery | null;
+  walls: TrackWallQuery;
+  /** The circuit's surfaces were fitted to its road (`metadata.mesh.conformSurfaces`); the scene fits its road too */
+  conformSurfaces: boolean;
+}
+
+const cache = new WeakMap<THREE.Object3D, TrackColliders>();
+
+/**
+ * A face at (x, z) faces the road when its normal points from it toward the active circuit's centreline, within 60°:
+ * a drawn block's end, square to the road, would push a car pressed into it back along the road a metre at a step
+ */
+export const roadFacing: RoadFacing = (x, z, nx, nz) => {
+  const { sample, lateralOffset } = getActiveTrackData(1200).projectWorldToTrack(x, z);
+  const b = sample.binormal;
+  const bl = Math.hypot(b.x, b.z) || 1;
+  return (-Math.sign(lateralOffset) * (nx * b.x + nz * b.z)) / bl > 0.5;
+};
+
+/**
+ * The active circuit's ground and barrier colliders for its loaded track root, built once and shared by the scene,
+ * every car model and the AI field
+ */
+export function trackColliders(root: THREE.Object3D): TrackColliders {
+  let colliders = cache.get(root);
+  if (!colliders) {
+    const mesh = getActiveTrackMetadata().mesh;
+    const conformSurfaces = mesh?.conformSurfaces === true;
+    // A GLB without a road collider (none of the shipped circuits) leaves the cars on the track samples' ground
+    const ground = root.getObjectByName('Track_Collider_Road')
+      ? TrackColliderQuery.fromTrackRoot(root, getActiveSurfaceTable(), {
+          conformSurfaces,
+          // Where the circuit's drawn surfaces say what its physics got wrong (drawn-surfaces.ts)
+          prepare: (r) => applyDrawnSurfaceRules(r, getActiveTrackData(1200), mesh?.roadMaterials, undefined, getActiveSurfaceTable()),
+        })
+      : null;
+    colliders = { ground, walls: TrackWallQuery.fromTrackRoot(root, mesh?.barrierMeshes, roadFacing), conformSurfaces };
+    cache.set(root, colliders);
+  }
+  return colliders;
+}
+
+/** A circuit's colliders as plain data, to hand to another thread (`trackRootFromColliderData` rebuilds them there) */
+export interface TrackColliderData {
+  ground: TrackColliderBuffers | null;
+  walls: TrackWallBuffers;
+  conformSurfaces: boolean;
+}
+
+export function trackColliderData(root: THREE.Object3D): TrackColliderData {
+  const { ground, walls, conformSurfaces } = trackColliders(root);
+  return { ground: ground ? ground.toBuffers() : null, walls: walls.toBuffers(), conformSurfaces };
+}
+
+/**
+ * A stand-in for the track's mesh where there is none (the simulation worker): cars attach to it as they do to the
+ * loaded track root, and drive on the colliders rebuilt from `data`
+ */
+export function trackRootFromColliderData(data: TrackColliderData): THREE.Object3D {
+  const root = new THREE.Object3D();
+  cache.set(root, {
+    ground: data.ground ? TrackColliderQuery.fromBuffers(data.ground) : null,
+    walls: TrackWallQuery.fromBuffers(data.walls),
+    conformSurfaces: data.conformSurfaces,
+  });
+  return root;
+}

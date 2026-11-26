@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=LibreCorsa Offline
+GenericName=Racing Simulator
+Comment=Air-gapped offline motorsport physics simulator
+Exec=librecorsa-offline %U
+Icon=librecorsa-offline
+Terminal=false
+Categories=Game;Simulation;Sports;
+Keywords=racing;formula;motorsport;simulator;offline;f1;
+StartupWMClass=librecorsa-offline-desktop
+Actions=Fullscreen;Hub;
+
+[Desktop Action Fullscreen]
+Name=Launch Fullscreen
+Exec=librecorsa-offline --fullscreen
+
+[Desktop Action Hub]
+Name=Open Home Hub
+Exec=librecorsa-offline --hub
