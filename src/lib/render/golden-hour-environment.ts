@@ -1075,8 +1075,22 @@ export function createPostFx(
 
     render(dtSeconds: number): void {
       if (canDirectRender()) {
+        // EffectComposer sets renderer.autoClear = false; without clearing here, WebGL's default framebuffer depth
+        // stays at 1.0 (failing GL_GEQUAL under reversedDepthBuffer) and rejects every fragment in the scene.
+        const { autoClear, autoClearColor, autoClearDepth, autoClearStencil } = renderer;
         renderer.setRenderTarget(null);
-        renderer.render(scene, mainCamera);
+        renderer.autoClear = true;
+        renderer.autoClearColor = true;
+        renderer.autoClearDepth = true;
+        renderer.autoClearStencil = false;
+        try {
+          renderer.render(scene, mainCamera);
+        } finally {
+          renderer.autoClear = autoClear;
+          renderer.autoClearColor = autoClearColor;
+          renderer.autoClearDepth = autoClearDepth;
+          renderer.autoClearStencil = autoClearStencil;
+        }
         return;
       }
       syncPassRouting();
