@@ -210,6 +210,8 @@ export interface GoldenHourEnvironment {
 
 export interface PostFx {
   composer: EffectComposer;
+  /** Render target the scene draws into (`null` when Low direct-renders straight to the default framebuffer) */
+  renderTarget(): THREE.WebGLRenderTarget | null;
   render(dtSeconds: number): void;
   setSize(width: number, height: number): void;
   /** swap the camera used by the render pass (the sim uses a single camera, but keep it safe) */
@@ -1023,6 +1025,20 @@ export function createPostFx(
   composer.addPass(bloomPass);
   composer.addPass(plainPass);
 
+  let qualityNow: "low" | "medium" | "high" = "high";
+  /**
+   * Direct-render fast path on Low graphics: when bloom, MSAA, volumetric clouds, and RCAS sharpening are all off,
+   * drawing straight to the default backbuffer skips the 64-bit HalfFloat offscreen FBO write/read and fullscreen
+   * blit every frame — cutting GPU memory bandwidth roughly in half on integrated GPUs (e.g. Intel HD 520/UHD).
+   * Three.js applies AgXToneMapping + sRGB output inline in the single forward pass.
+   */
+  const canDirectRender = (): boolean =>
+    qualityNow === "low" &&
+    !bloomPass.enabled &&
+    composer.multisampling === 0 &&
+    sharpnessNow === 0 &&
+    !(sky?.cloudsActive && cloudsPass && cloudsPlainPass);
+
   const syncPassRouting = () => {
     const cloudsOn = Boolean(sky?.cloudsActive && cloudsPass && cloudsPlainPass);
     const bloomOn = bloomPass.enabled;
@@ -1053,7 +1069,16 @@ export function createPostFx(
   return {
     composer,
 
+    renderTarget(): THREE.WebGLRenderTarget | null {
+      return canDirectRender() ? null : composer.inputBuffer;
+    },
+
     render(dtSeconds: number): void {
+      if (canDirectRender()) {
+        renderer.setRenderTarget(null);
+        renderer.render(scene, mainCamera);
+        return;
+      }
       syncPassRouting();
       if (edgeGlowSinceMs !== null) {
         const level = edgeGlowSteady ? 1 : edgeGlowLevel(performance.now() - edgeGlowSinceMs);
@@ -1077,6 +1102,7 @@ export function createPostFx(
     },
 
     setQuality(quality: "low" | "medium" | "high", msaa = true, bloom = quality === "high" && msaa): void {
+      qualityNow = quality;
       const touch = isTouchDevice();
       // Tile-based mobile GPUs suffer heavy DRAM bandwidth penalties resolving HalfFloat MSAA buffers, so touch stays 0×
       composer.multisampling = !msaa || touch ? 0 : quality === "high" ? 4 : quality === "medium" ? 2 : 0;

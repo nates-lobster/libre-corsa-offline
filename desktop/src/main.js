@@ -26,6 +26,7 @@ let localServer = null;
 
 const noGpuPref = process.argv.includes("--no-gpu-pref") || process.env.LIBRECORSA_NO_GPU_PREF === "1";
 const noGpuOverrides = process.env.LIBRECORSA_NO_GPU_OVERRIDES === "1";
+const forceLinuxGpuOverrides = process.env.LIBRECORSA_FORCE_GPU_OVERRIDES === "1";
 const printGpuInfoOnly = process.argv.includes("--gpu-info");
 
 // On Windows 10/11 hybrid GPU laptops (Intel/AMD iGPU + NVIDIA/AMD/Arc dGPU),
@@ -37,17 +38,26 @@ const winGpuPrefResult =
     : { status: "skipped", changed: false, exePath: process.execPath };
 
 // Prefer discrete GPU & smooth hardware WebGL2 rendering across Windows, Linux, and macOS.
+// On Linux, respect Chromium's Mesa/Intel GPU workarounds by default (forcing --ignore-gpu-blocklist
+// or --enable-zero-copy can crash pre-Ice Lake Intel GPUs such as Skylake HD 520); users can opt
+// into aggressive overrides with LIBRECORSA_FORCE_GPU_OVERRIDES=1.
 if (!noGpuOverrides) {
   app.commandLine.appendSwitch("force_high_performance_gpu");
-  app.commandLine.appendSwitch("enable-gpu-rasterization");
-  app.commandLine.appendSwitch("ignore-gpu-blocklist");
 
   if (process.platform === "win32") {
     // ANGLE D3D11 honors DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE + Windows UserGpuPreferences.
     app.commandLine.appendSwitch("use-angle", process.env.LIBRECORSA_ANGLE || "d3d11");
+    app.commandLine.appendSwitch("enable-gpu-rasterization");
+    app.commandLine.appendSwitch("ignore-gpu-blocklist");
   } else if (process.platform === "linux") {
     app.commandLine.appendSwitch("ozone-platform-hint", "auto");
-    app.commandLine.appendSwitch("enable-zero-copy");
+    if (forceLinuxGpuOverrides) {
+      app.commandLine.appendSwitch("enable-gpu-rasterization");
+      app.commandLine.appendSwitch("enable-zero-copy");
+      app.commandLine.appendSwitch("ignore-gpu-blocklist");
+    }
+  } else {
+    app.commandLine.appendSwitch("enable-gpu-rasterization");
   }
 } else if (process.platform === "linux") {
   app.commandLine.appendSwitch("ozone-platform-hint", "auto");
@@ -156,7 +166,6 @@ function buildAppMenu() {
         {
           label: "Toggle Fullscreen",
           accelerator: "F11",
-          registerAccelerator: false,
           click: () => toggleFullscreen(),
         },
         ...(isMac ? [{ role: "togglefullscreen" }] : []),
@@ -310,21 +319,6 @@ function createMainWindow(startUrl) {
 
   win.once("ready-to-show", () => {
     win.show();
-  });
-
-  win.webContents.on("before-input-event", (event, input) => {
-    if (
-      input.type === "keyDown" &&
-      input.key === "F11" &&
-      !input.isAutoRepeat &&
-      !input.alt &&
-      !input.control &&
-      !input.meta &&
-      !input.shift
-    ) {
-      event.preventDefault();
-      toggleFullscreen();
-    }
   });
 
   win.on("closed", () => {

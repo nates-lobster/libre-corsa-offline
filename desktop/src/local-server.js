@@ -32,7 +32,7 @@ const MIME_TYPES = {
 
 const OFFLINE_CSP = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'",
+  "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
