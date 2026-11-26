@@ -18,7 +18,6 @@ import {
 import { carBoardTag } from "@/lib/cars/board-tag";
 import { LIVERIES, LIVERY_CATEGORY_LABELS } from "@/lib/track-data";
 import { VEHICLE_MODEL_IDS, type LiveryConfig, type VehicleModelId } from "@/types/f1";
-import { REPO_CAR_IDS, REPO_TRACK_IDS } from "@/lib/hosted-content";
 import outlines from "@/lib/home/circuit-outlines.json";
 import whatsNewJson from "@/lib/home/whats-new.json";
 import type { LapOutline } from "@/lib/home/lap-outline";
@@ -32,11 +31,10 @@ import { CIRCUIT_TYPE_LABELS, CIRCUIT_VENUES, DEFAULT_TRACK_ID, VENUE_HERO_WIDTH
 const OUTLINES = outlines as unknown as Record<string, LapOutline>;
 
 /**
- * A car's picture, or null when this copy has none. The repository's own cars keep theirs in the repository, so a
- * missing file means there is no picture; a hosted car's is served from the asset bucket, not from this folder.
+ * A car's picture, or null when this offline build doesn't have the file locally under `public/`.
  */
-function variantThumbOf(id: CarId, url: string): string | null {
-  if (REPO_CAR_IDS.has(id) && !existsSync(join(process.cwd(), "public", url))) return null;
+function variantThumbOf(_id: CarId, url: string): string | null {
+  if (!existsSync(join(process.cwd(), "public", url))) return null;
   return withBasePath(url);
 }
 
@@ -45,15 +43,16 @@ function thumbOf(id: CarId): string | null {
 }
 
 /**
- * A venue's scenic Drive-tile hero still, or null when this copy has none. Repo circuits keep theirs in git; hosted
- * circuits serve theirs from the asset bucket (and fall back cleanly in VenueHero if not yet uploaded).
+ * A venue's scenic Drive-tile hero still, or null when this offline build doesn't have it locally under `public/`.
  */
 function venueHeroOf(venueId: string): HomeVenueHero | null {
   const full = venueHeroUrl(venueId, 1600);
-  if (REPO_TRACK_IDS.has(venueId) && !existsSync(join(process.cwd(), "public", full))) return null;
+  if (!existsSync(join(process.cwd(), "public", full))) return null;
+  const availableWidths = VENUE_HERO_WIDTHS.filter((w) => existsSync(join(process.cwd(), "public", venueHeroUrl(venueId, w))));
+  const widths = availableWidths.length ? availableWidths : ([1600] as const);
   return {
     src: withBasePath(full),
-    srcSet: VENUE_HERO_WIDTHS.map((w) => `${withBasePath(venueHeroUrl(venueId, w))} ${w}w`).join(", "),
+    srcSet: widths.map((w) => `${withBasePath(venueHeroUrl(venueId, w))} ${w}w`).join(", "),
   };
 }
 

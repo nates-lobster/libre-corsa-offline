@@ -19,7 +19,7 @@ import * as THREE from "three";
 import type { TireCompound } from "@/types/f1";
 import type { CarClassId, CarId } from "@/lib/cars/car-registry";
 import { withBasePath } from "@/lib/base-path";
-import { HOSTED_CONTENT } from "@/lib/hosted-content";
+import { HAS_SHARED_TYRES } from "@/lib/hosted-content";
 import { isStoreBuild } from "@/lib/store-mode";
 import { sidewallBand } from "./pirelli-sidewall";
 
@@ -123,7 +123,7 @@ export function defaultGtTyreBrand(carId: CarId | string, classId?: CarClassId):
 
 /** Whether third-party GT tyre sidewalls may be fetched in this runtime */
 export function canLoadGtTyreSidewall(): boolean {
-  return typeof window !== "undefined" && HOSTED_CONTENT && !isStoreBuild();
+  return typeof window !== "undefined" && HAS_SHARED_TYRES && !isStoreBuild();
 }
 
 interface TextureSlot {

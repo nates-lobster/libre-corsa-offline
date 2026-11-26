@@ -250,15 +250,14 @@ export class SimVisualFxManager {
     }
 
     this.skidGeom = new THREE.BufferGeometry();
-    this.skidGeom.setAttribute(
-      'position',
-      new THREE.BufferAttribute(this.skidPositions, 3)
-    );
-    this.skidGeom.setAttribute(
-      'color',
-      new THREE.BufferAttribute(this.skidColors, 4)
-    );
+    const skidPosAttr = new THREE.BufferAttribute(this.skidPositions, 3);
+    skidPosAttr.setUsage(THREE.DynamicDrawUsage);
+    const skidColAttr = new THREE.BufferAttribute(this.skidColors, 4);
+    skidColAttr.setUsage(THREE.DynamicDrawUsage);
+    this.skidGeom.setAttribute('position', skidPosAttr);
+    this.skidGeom.setAttribute('color', skidColAttr);
     this.skidGeom.setIndex(new THREE.BufferAttribute(indices, 1));
+    this.skidGeom.setDrawRange(0, 0);
 
     const skidMat = new THREE.MeshBasicMaterial({
       vertexColors: true,
@@ -608,8 +607,15 @@ export class SimVisualFxManager {
       col[idx + 3] = a;
     }
 
-    (this.skidGeom.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-    (this.skidGeom.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+    const posAttr = this.skidGeom.attributes.position as THREE.BufferAttribute;
+    const colAttr = this.skidGeom.attributes.color as THREE.BufferAttribute;
+    posAttr.addUpdateRange(vBase, 12);
+    posAttr.needsUpdate = true;
+    colAttr.addUpdateRange(cBase, 16);
+    colAttr.needsUpdate = true;
+    if (this.skidHead <= MAX_SKID_SEGMENTS) {
+      this.skidGeom.setDrawRange(0, this.skidHead * 6);
+    }
   }
 
   private spawnParticle(

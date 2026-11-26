@@ -37,30 +37,27 @@ const winGpuPrefResult =
     ? ensureWindowsHighPerformanceGpu(process.execPath)
     : { status: "skipped", changed: false, exePath: process.execPath };
 
-// Prefer discrete GPU & smooth hardware WebGL2 rendering across Windows, Linux, and macOS.
-// On Linux, respect Chromium's Mesa/Intel GPU workarounds by default (forcing --ignore-gpu-blocklist
-// or --enable-zero-copy can crash pre-Ice Lake Intel GPUs such as Skylake HD 520); users can opt
-// into aggressive overrides with LIBRECORSA_FORCE_GPU_OVERRIDES=1.
-if (!noGpuOverrides) {
+// Prefer discrete GPU & smooth hardware WebGL2 rendering on Windows and macOS.
+// On Linux, keep Chromium's native Mesa/Intel GPU defaults untouched (forcing --force_high_performance_gpu,
+// --ignore-gpu-blocklist, or --enable-zero-copy can regress/hang Intel Skylake HD 520 and older GPUs);
+// users can opt into aggressive Linux flags with LIBRECORSA_FORCE_GPU_OVERRIDES=1 or force X11/Wayland
+// with LIBRECORSA_OZONE=x11|wayland.
+if (process.platform === "linux") {
+  app.commandLine.appendSwitch("ozone-platform-hint", process.env.LIBRECORSA_OZONE || "auto");
+  if (!noGpuOverrides && forceLinuxGpuOverrides) {
+    app.commandLine.appendSwitch("force_high_performance_gpu");
+    app.commandLine.appendSwitch("enable-gpu-rasterization");
+    app.commandLine.appendSwitch("enable-zero-copy");
+    app.commandLine.appendSwitch("ignore-gpu-blocklist");
+  }
+} else if (!noGpuOverrides) {
   app.commandLine.appendSwitch("force_high_performance_gpu");
-
+  app.commandLine.appendSwitch("enable-gpu-rasterization");
   if (process.platform === "win32") {
     // ANGLE D3D11 honors DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE + Windows UserGpuPreferences.
     app.commandLine.appendSwitch("use-angle", process.env.LIBRECORSA_ANGLE || "d3d11");
-    app.commandLine.appendSwitch("enable-gpu-rasterization");
     app.commandLine.appendSwitch("ignore-gpu-blocklist");
-  } else if (process.platform === "linux") {
-    app.commandLine.appendSwitch("ozone-platform-hint", "auto");
-    if (forceLinuxGpuOverrides) {
-      app.commandLine.appendSwitch("enable-gpu-rasterization");
-      app.commandLine.appendSwitch("enable-zero-copy");
-      app.commandLine.appendSwitch("ignore-gpu-blocklist");
-    }
-  } else {
-    app.commandLine.appendSwitch("enable-gpu-rasterization");
   }
-} else if (process.platform === "linux") {
-  app.commandLine.appendSwitch("ozone-platform-hint", "auto");
 }
 
 if (process.platform === "win32") {
@@ -70,11 +67,6 @@ if (process.platform === "win32") {
 const gotSingleInstanceLock = printGpuInfoOnly ? true : app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
-}
-
-function toggleFullscreen() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.setFullScreen(!mainWindow.isFullScreen());
 }
 
 async function queryLiveWebglRenderer() {
@@ -163,12 +155,7 @@ function buildAppMenu() {
     {
       label: "View",
       submenu: [
-        {
-          label: "Toggle Fullscreen",
-          accelerator: "F11",
-          click: () => toggleFullscreen(),
-        },
-        ...(isMac ? [{ role: "togglefullscreen" }] : []),
+        { role: "togglefullscreen" },
         { type: "separator" },
         {
           label: "Home Hub",
