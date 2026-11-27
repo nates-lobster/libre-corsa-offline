@@ -327,6 +327,11 @@ app.on("second-instance", () => {
 });
 
 app.on("before-quit", () => {
+  try {
+    session.defaultSession.flushStorageData();
+  } catch {
+    // Best-effort storage flush before exit.
+  }
   if (localServer) {
     void localServer.close();
     localServer = null;
