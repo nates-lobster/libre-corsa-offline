@@ -16,6 +16,7 @@ const {
   pickPreferredHidDevice,
 } = require("../src/hid-policy");
 const {
+  DEFAULT_DESKTOP_PORT,
   OFFLINE_CSP,
   resolveStaticFile,
   startLocalServer,
@@ -199,6 +200,32 @@ describe("local-server (loopback static hosting)", () => {
         assert.equal(missRes.status, 404);
       } finally {
         await srv.close();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a fixed default port (18421) for persistent storage and falls back if busy", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lc-offline-port-"));
+    try {
+      fs.writeFileSync(path.join(tmp, "play.html"), "<h1>Play</h1>");
+
+      const first = await startLocalServer({ webDir: tmp });
+      try {
+        assert.equal(first.port, DEFAULT_DESKTOP_PORT);
+        assert.equal(first.origin, `http://127.0.0.1:${DEFAULT_DESKTOP_PORT}`);
+
+        // Starting a second instance while 18421 is busy falls back cleanly to 18422 instead of throwing EADDRINUSE
+        const second = await startLocalServer({ webDir: tmp });
+        try {
+          assert.equal(second.port, DEFAULT_DESKTOP_PORT + 1);
+          assert.equal(second.origin, `http://127.0.0.1:${DEFAULT_DESKTOP_PORT + 1}`);
+        } finally {
+          await second.close();
+        }
+      } finally {
+        await first.close();
       }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

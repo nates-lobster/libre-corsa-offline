@@ -114,13 +114,38 @@ function resolveStaticFile(rootDir, rawPathname) {
 }
 
 /**
+ * Stable loopback port for the Electron desktop app so Chromium keeps the same
+ * origin (`http://127.0.0.1:18421`) across launches — preserving localStorage
+ * and IndexedDB (settings, graphics preset, bindings, personal bests, ghosts,
+ * garage setups, race history, and AI learning). Distinct from the browser
+ * offline server default (18420) so both can run side-by-side without conflict.
+ */
+const DEFAULT_DESKTOP_PORT = 18421;
+
+/**
  * Start a strictly loopback-only HTTP server on 127.0.0.1 for the Electron shell.
+ * Uses a fixed default port (18421) so persistent browser storage (localStorage &
+ * IndexedDB) keeps the same origin across app restarts; falls back to nearby ports
+ * if 18421 is busy.
  * @param {{ webDir?: string, port?: number }} [opts]
  * @returns {Promise<{ server: http.Server, origin: string, playUrl: string, port: number, webRoot: string, close: () => Promise<void> }>}
  */
 function startLocalServer(opts = {}) {
   const webRoot = resolveWebRoot(opts.webDir);
-  const requestedPort = opts.port !== undefined ? opts.port : Number(process.env.LIBRECORSA_PORT || 0);
+  const explicitPort =
+    opts.port !== undefined
+      ? opts.port
+      : process.env.LIBRECORSA_PORT !== undefined && process.env.LIBRECORSA_PORT !== ""
+        ? Number(process.env.LIBRECORSA_PORT)
+        : null;
+  const candidatePorts =
+    explicitPort !== null
+      ? [explicitPort]
+      : [
+          DEFAULT_DESKTOP_PORT,
+          ...Array.from({ length: 9 }, (_, i) => DEFAULT_DESKTOP_PORT + 1 + i),
+          0,
+        ];
 
   const server = http.createServer((req, res) => {
     const method = req.method || "GET";
@@ -186,24 +211,50 @@ function startLocalServer(opts = {}) {
   });
 
   return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(requestedPort, "127.0.0.1", () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : requestedPort;
-      const origin = `http://127.0.0.1:${port}`;
-      resolve({
-        server,
-        origin,
-        playUrl: `${origin}/play`,
-        port,
-        webRoot,
-        close: () => new Promise((done) => server.close(() => done())),
-      });
-    });
+    let idx = 0;
+
+    const tryNext = () => {
+      const targetPort = candidatePorts[idx];
+      const onError = (err) => {
+        server.removeListener("listening", onListening);
+        if (err && err.code === "EADDRINUSE" && idx + 1 < candidatePorts.length) {
+          idx++;
+          tryNext();
+          return;
+        }
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener("error", onError);
+        const addr = server.address();
+        const port = typeof addr === "object" && addr ? addr.port : targetPort;
+        if (explicitPort === null && port !== DEFAULT_DESKTOP_PORT) {
+          console.warn(
+            `[librecorsa-offline] Default port ${DEFAULT_DESKTOP_PORT} was busy; using ${port} (settings/saves are tied to origin port).`,
+          );
+        }
+        const origin = `http://127.0.0.1:${port}`;
+        resolve({
+          server,
+          origin,
+          playUrl: `${origin}/play`,
+          port,
+          webRoot,
+          close: () => new Promise((done) => server.close(() => done())),
+        });
+      };
+
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(targetPort, "127.0.0.1");
+    };
+
+    tryNext();
   });
 }
 
 module.exports = {
+  DEFAULT_DESKTOP_PORT,
   OFFLINE_CSP,
   resolveWebRoot,
   resolveStaticFile,
